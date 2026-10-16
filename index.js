@@ -9,25 +9,39 @@ app.use(cors());
 let CACHE = { data: null, time: 0 };
 
 app.get('/', async (req, res) => {
-  if (Date.now() - CACHE.time < 10*60*1000 && CACHE.data) return res.json({...CACHE.data, source: 'cache'});
+  if (Date.now() - CACHE.time < 5*60*1000 && CACHE.data) {
+    return res.json({...CACHE.data, source: 'cache'});
+  }
   try {
-    const response = await gotScraping.get('https://www.taiwan-lotto.com/', {
+    const response = await gotScraping.get('https://livedrawtaiwan.info/', {
       headerGeneratorOptions: { browsers: [{ name: 'chrome', minVersion: 110 }] }
     });
-    const html = response.body;
-    const $ = cheerio.load(html);
-    const marqueeText = $('#marqueeinfo').text() || html;
-    const special = marqueeText.match(/Special Prize\s*:\s*(\d+)/i)?.[1] || null;
-    const grand = marqueeText.match(/Grand Prize\s*:\s*(\d+)/i)?.[1] || null;
+    const $ = cheerio.load(response.body);
+    const text = $('body').text();
+
+    // pola di livedrawtaiwan.info biasanya: Special Prize 12345678 dll
+    const special = text.match(/Special Prize\s*[:\-]?\s*(\d{6,8})/i)?.[1] || null;
+    const grand = text.match(/Grand Prize\s*[:\-]?\s*(\d{6,8})/i)?.[1] || null;
+    const regular = text.match(/Regular Prize\s*[:\-]?\s*(\d{6,8})/i)?.[1] || null;
+
+    // ambil semua angka 8 digit yang ada sebagai backup
+    const allNumbers = [...new Set(text.match(/\d{8}/g) || [])];
+
     const result = {
       status: 'sukses',
       waktu_wib: new Date().toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' }),
-      data: { special_prize: special, grand_prize: grand }
+      sumber: 'livedrawtaiwan.info',
+      data: {
+        special_prize: special || allNumbers[0] || null,
+        grand_prize: grand || allNumbers[1] || null,
+        regular_prize: regular || allNumbers[2] || null,
+        semua_angka: allNumbers.slice(0,10)
+      }
     };
     CACHE = { data: result, time: Date.now() };
     res.json(result);
   } catch (e) {
-    res.status(500).json({ status: 'error', pesan: e.message });
+    res.status(500).json({ status: 'error', pesan: e.message, stack: e.stack?.substring(0,500) });
   }
 });
 
