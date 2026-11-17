@@ -2,10 +2,68 @@ const express = require('express');
 const axios = require('axios');
 const cheerio = require('cheerio');
 const cors = require('cors');
+const https = require('https');
 const { randomUUID } = require('crypto');
 const { fetchDenganFallback } = require('./proxyHelper');
 const app = express();
 app.use(cors());
+
+const FETCH_TIMEOUT_MS = 5000;
+
+function gabungSignal(signal, ms = FETCH_TIMEOUT_MS) {
+    const tSignal = AbortSignal.timeout(ms);
+    if (!signal) return tSignal;
+    if (typeof AbortSignal.any === 'function') {
+        return AbortSignal.any([signal, tSignal]);
+    }
+    const ctrl = new AbortController();
+    const onAbort = () => ctrl.abort();
+    if (signal.aborted || tSignal.aborted) {
+        ctrl.abort();
+        return ctrl.signal;
+    }
+    signal.addEventListener('abort', onAbort, { once: true });
+    tSignal.addEventListener('abort', onAbort, { once: true });
+    return ctrl.signal;
+}
+
+const httpsAgentAman = new https.Agent({
+    keepAlive: true,
+    minVersion: 'TLSv1.2'
+});
+
+const httpsAgentKhususIP = new https.Agent({
+    rejectUnauthorized: false,
+    keepAlive: true,
+    minVersion: 'TLSv1.2',
+    ciphers: [
+        'TLS_AES_128_GCM_SHA256',
+        'TLS_AES_256_GCM_SHA384',
+        'TLS_CHACHA20_POLY1305_SHA256',
+        'ECDHE-ECDSA-AES128-GCM-SHA256',
+        'ECDHE-RSA-AES128-GCM-SHA256',
+        'ECDHE-ECDSA-AES256-GCM-SHA384',
+        'ECDHE-RSA-AES256-GCM-SHA384',
+        'ECDHE-ECDSA-CHACHA20-POLY1305',
+        'ECDHE-RSA-CHACHA20-POLY1305',
+        'ECDHE-RSA-AES128-SHA',
+        'ECDHE-RSA-AES256-SHA',
+        'AES128-GCM-SHA256',
+        'AES256-GCM-SHA384',
+        'AES128-SHA',
+        'AES256-SHA'
+    ].join(':')
+});
+
+function getHttpsAgentUntukUrl(targetUrl) {
+    try {
+        const hostname = new URL(targetUrl).hostname;
+        if (/^\d{1,3}(\.\d{1,3}){3}$/.test(hostname)) {
+            return httpsAgentKhususIP;
+        }
+    } catch {}
+    return httpsAgentAman;
+}
 
 // ================= ZONA WAKTU =================
 const STATE_TZ = {
@@ -26,12 +84,10 @@ const STATE_TZ = {
     'new-jersey': 'America/New_York'
 };
 
-// Slug negara bagian pada LotteryUSA.
 const STATE_SLUG = {
     'washington-dc': 'district-of-columbia'
 };
 
-// Alias endpoint API -> slug game asli LotteryUSA.
 const GAME_ALIAS = {
     'texas/morning-daily-4': 'morning-pick-4',
     'texas/day-daily-4': 'midday-4',
@@ -77,6 +133,15 @@ function partsInTZ(date, tz) {
 
 const iso = ({ y, m, d }) =>
     `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+
+function getWIBDateString() {
+    const { y, m, d } = partsInTZ(new Date(), 'Asia/Jakarta');
+    return `${y}${String(m).padStart(2, '0')}${String(d).padStart(2, '0')}`;
+}
+
+function escapeRegex(value) {
+    return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
 
 function tanggalValid(value) {
     if (!value) return false;
@@ -177,7 +242,6 @@ function getTanggalWIB(waktu = new Date()) {
     return `${hari[hr]}, ${d} ${bulan[m - 1]} ${y}`;
 }
 
-// Parse ISO, "Oct 19, 2026", dan "October 19".
 function parseTanggal(str, tzNow) {
     if (!str) return null;
 
@@ -221,7 +285,170 @@ function parseTanggal(str, tzNow) {
     return null;
 }
 
-// ================= JADWAL UNDIAN =================
+// ================= VALIDASI TANGGAL & SLOT DARI SCRAPER.JS =================
+
+const MONTHS_ID_LOWER = [
+    'januari', 'februari', 'maret', 'april', 'mei', 'juni',
+    'juli', 'agustus', 'september', 'oktober', 'november', 'desember'
+];
+
+const MONTHS_EN_LOWER = [
+    'january', 'february', 'march', 'april', 'may', 'june',
+    'july', 'august', 'september', 'october', 'november', 'december'
+];
+
+const MONTHS_SHORT_MAP = {
+    jan: 1, feb: 2, mar: 3, apr: 4, mei: 5, may: 5,
+    jun: 6, jul: 7, agu: 8, aug: 8, sep: 9, okt: 10,
+    oct: 10, nov: 11, des: 12, dec: 12
+};
+
+function getMonthNumber(name) {
+    const value = String(name || '')
+        .toLowerCase()
+        .replace(/\./g, '')
+        .trim();
+
+    const idIndex = MONTHS_ID_LOWER.indexOf(value);
+    if (idIndex !== -1) return idIndex + 1;
+
+    const enIndex = MONTHS_EN_LOWER.indexOf(value);
+    if (enIndex !== -1) return enIndex + 1;
+
+    return MONTHS_SHORT_MAP[value] || 0;
+}
+
+function hasExactWIBDate(text) {
+    const value = String(text || '');
+    if (!value.trim()) return false;
+
+    const { y: year, m: month, d: day } = partsInTZ(new Date(), 'Asia/Jakarta');
+
+    const monthNames = [
+        ...MONTHS_ID_LOWER,
+        ...MONTHS_EN_LOWER,
+        ...Object.keys(MONTHS_SHORT_MAP)
+    ]
+        .sort((a, b) => b.length - a.length)
+        .map(escapeRegex)
+        .join('|');
+
+    const namedDateRegex = new RegExp(
+        `(?:^|[^\\d])(\\d{1,2})\\s+(${monthNames})\\.?[,]?\\s+(\\d{4})(?!\\d)`,
+        'gi'
+    );
+
+    let match;
+    while ((match = namedDateRegex.exec(value)) !== null) {
+        const foundDay = Number(match[1]);
+        const foundMonth = getMonthNumber(match[2]);
+        const foundYear = Number(match[3]);
+
+        if (foundDay === day && foundMonth === month && foundYear === year) {
+            return true;
+        }
+    }
+
+    const sep = '[\\s./-]+';
+    const dd = String(day).padStart(2, '0');
+    const mm = String(month).padStart(2, '0');
+    const yyyy = String(year);
+
+    const numericPatterns = [
+        new RegExp(`(?:^|\\D)${dd}${sep}${mm}${sep}${yyyy}(?!\\d)`),
+        new RegExp(`(?:^|\\D)${day}${sep}${month}${sep}${yyyy}(?!\\d)`),
+        new RegExp(`(?:^|\\D)${mm}${sep}${dd}${sep}${yyyy}(?!\\d)`),
+        new RegExp(`(?:^|\\D)${yyyy}${sep}${mm}${sep}${dd}(?!\\d)`),
+        new RegExp(`(?:^|\\D)${yyyy}${mm}${dd}(?!\\d)`),
+        new RegExp(`(?:^|\\D)${dd}${mm}${yyyy}(?!\\d)`)
+    ];
+
+    return numericPatterns.some(pattern => pattern.test(value));
+}
+
+function isDateValid(htmlContent) {
+    const { y: year, m: month, d: day } = partsInTZ(new Date(), 'Asia/Jakarta');
+
+    const dayNoZero = String(day);
+    const dayTwo = String(day).padStart(2, '0');
+    const monthNoZero = String(month);
+    const monthTwo = String(month).padStart(2, '0');
+    const shortYear = String(year).slice(-2);
+
+    const monthNamesId = [
+        'Januari', 'Februari', 'Maret', 'April', 'Mei', 'Juni',
+        'Juli', 'Agustus', 'September', 'Oktober', 'November', 'Desember'
+    ];
+    const monthNamesEn = [
+        'January', 'February', 'March', 'April', 'May', 'June',
+        'July', 'August', 'September', 'October', 'November', 'December'
+    ];
+
+    const id = monthNamesId[month - 1];
+    const en = monthNamesEn[month - 1];
+    const idShort = id.slice(0, 3);
+    const enShort = en.slice(0, 3);
+
+    const sep = '[-/.,\\s]+';
+    const boundary = '(?<!\\d)';
+    const endBoundary = '(?!\\d)';
+
+    const patterns = [
+        `${boundary}0?${dayNoZero}${sep}0?${monthNoZero}${sep}${year}${endBoundary}`,
+        `${boundary}${year}${sep}0?${monthNoZero}${sep}0?${dayNoZero}${endBoundary}`,
+        `${boundary}0?${monthNoZero}${sep}0?${dayNoZero}${sep}${year}${endBoundary}`,
+        `${boundary}0?${dayNoZero}${sep}0?${monthNoZero}${sep}${shortYear}${endBoundary}`,
+        `${boundary}0?${monthNoZero}${sep}0?${dayNoZero}${sep}${shortYear}${endBoundary}`,
+        `${boundary}${shortYear}${sep}0?${monthNoZero}${sep}0?${dayNoZero}${endBoundary}`,
+        `${boundary}0?${dayNoZero}${sep}${escapeRegex(id)}${sep}${year}${endBoundary}`,
+        `${boundary}0?${dayNoZero}${sep}${escapeRegex(idShort)}${sep}${year}${endBoundary}`,
+        `${boundary}${escapeRegex(id)}${sep}0?${dayNoZero}${sep}${year}${endBoundary}`,
+        `${boundary}${escapeRegex(idShort)}${sep}0?${dayNoZero}${sep}${year}${endBoundary}`,
+        `${boundary}0?${dayNoZero}${sep}${escapeRegex(en)}${sep}${year}${endBoundary}`,
+        `${boundary}0?${dayNoZero}${sep}${escapeRegex(enShort)}${sep}${year}${endBoundary}`,
+        `${boundary}${escapeRegex(en)}${sep}0?${dayNoZero}${sep}${year}${endBoundary}`,
+        `${boundary}${escapeRegex(enShort)}${sep}0?${dayNoZero}${sep}${year}${endBoundary}`,
+        `${boundary}${dayTwo}${monthTwo}${year}${endBoundary}`,
+        `${boundary}${year}${monthTwo}${dayTwo}${endBoundary}`,
+        `${boundary}${dayTwo}${escapeRegex(enShort)}${year}${endBoundary}`,
+        `${boundary}${dayTwo}${escapeRegex(idShort)}${year}${endBoundary}`,
+        `${boundary}0?${dayNoZero}${sep}${escapeRegex(id)}${endBoundary}`,
+        `${boundary}0?${dayNoZero}${sep}${escapeRegex(idShort)}${endBoundary}`,
+        `${boundary}0?${dayNoZero}${sep}${escapeRegex(en)}${endBoundary}`,
+        `${boundary}0?${dayNoZero}${sep}${escapeRegex(enShort)}${endBoundary}`,
+        `${boundary}${escapeRegex(en)}${sep}0?${dayNoZero}${endBoundary}`,
+        `${boundary}${escapeRegex(enShort)}${sep}0?${dayNoZero}${endBoundary}`
+    ];
+
+    const str = String(htmlContent || '');
+    return patterns.some(pattern => new RegExp(pattern, 'i').test(str));
+}
+
+function getMacauSlotValue(pageText, jam) {
+    const re = /JAM\s+(\d{2}[:.]\d{2})(?!\s*WIB)/gi;
+    const jams = [];
+    let last = 0;
+    let m;
+
+    while ((m = re.exec(pageText))) {
+        jams.push(m[1].replace('.', ':'));
+        last = re.lastIndex;
+    }
+
+    if (jams.length === 0) return null;
+
+    const nums = (pageText.slice(last).match(/\b\d{4}\b/g) || []).slice(0, jams.length);
+    const target = String(jam).replace('.', ':');
+    let i = jams.indexOf(target);
+
+    if (i < 0 && target === '00:00') {
+        i = jams.indexOf('00:01');
+    }
+
+    return i >= 0 ? nums[i] || null : null;
+}
+
+// ================= JADWAL UNDIAN US =================
 const JADWAL = {
     'texas/morning-daily-4': '10:00',
     'texas/day-daily-4': '12:27',
@@ -274,7 +501,6 @@ const JADWAL = {
 
 const JAM_DEFAULT = '13:00';
 
-// Slot pasaran WIB.
 const SLOT_WIB = {
     'kentucky/midday-pick-4': '00:11',
     'florida/pick-4-midday': '00:21',
@@ -302,6 +528,72 @@ const SLOT_WIB = {
     'texas/night-daily-4': '10:15',
     'oregon/10-pm-pick-4': '11:51',
     'texas/morning-daily-4': '22:00'
+};
+
+// Seluruh sumber tercepat US langsung dari config.js kamu
+const US_SUMBER_TERCEPAT = {
+    'kentucky/midday-pick-4': {
+        url: 'https://togel-online.cc/livedraw/kentucky%20mid',
+        selector: 'p.text-gold'
+    },
+    'florida/pick-4-midday': {
+        url: 'https://togel-online.cc/livedraw/florida%20mid',
+        selector: 'p.text-gold'
+    },
+    'washington-dc/dc-4-midday': {
+        url: 'https://dclottery.com/games/dc-4',
+        selector: '.views-field-data .field-content .ball',
+        gabung: true
+    },
+    'new-york/midday-win-4': {
+        url: 'https://togel-online.cc/livedraw/newyork%20mid',
+        selector: 'p.text-gold'
+    },
+    'north-carolina/midday-pick-4': {
+        url: 'https://togel-online.cc/livedraw/carolina%20day',
+        selector: 'p.text-gold'
+    },
+    'oregon/1-pm-pick-4': {
+        url: 'https://togel-online.cc/livedraw/oregon03',
+        selector: 'p.text-gold'
+    },
+    'oregon/4-pm-pick-4': {
+        url: 'https://togel-online.cc/livedraw/oregon06',
+        selector: 'p.text-gold'
+    },
+    'washington-dc/dc-4': {
+        url: 'https://dclottery.com/games/dc-4',
+        selector: '.views-field-data .field-content .ball',
+        gabung: true
+    },
+    'florida/pick-4-evening': {
+        url: 'https://togel-online.cc/livedraw/florida%20eve',
+        selector: 'p.text-gold'
+    },
+    'oregon/7-pm-pick-4': {
+        url: 'https://togel-online.cc/livedraw/oregon09',
+        selector: 'p.text-gold'
+    },
+    'new-york/win-4': {
+        url: 'https://togel-online.cc/livedraw/newyork%20eve',
+        selector: 'p.text-gold'
+    },
+    'kentucky/pick-4': {
+        url: 'https://togel-online.cc/livedraw/kentucky%20eve',
+        selector: 'p.text-gold'
+    },
+    'california/daily-4': {
+        url: 'https://togel-online.cc/livedraw/california',
+        selector: 'p.text-gold'
+    },
+    'north-carolina/pick-4': {
+        url: 'https://togel-online.cc/livedraw/carolina%20eve',
+        selector: 'p.text-gold'
+    },
+    'oregon/10-pm-pick-4': {
+        url: 'https://togel-online.cc/livedraw/oregon12',
+        selector: 'p.text-gold'
+    }
 };
 
 function slotWIB(tglUS, tz, slot) {
@@ -340,10 +632,10 @@ function slotWIB(tglUS, tz, slot) {
 // ================= FETCH =================
 
 const USER_AGENTS = [
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.4 Safari/605.1.15',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0',
-    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
 ];
 
 function getRandomHeaders() {
@@ -367,19 +659,23 @@ const diblokCF = data => {
     );
 };
 
-async function ambil(url) {
-    const headers = getRandomHeaders();
+async function ambil(url, options = {}) {
+    const headers = options.headers || getRandomHeaders();
+    const signal = gabungSignal(options.signal, options.timeoutMs || FETCH_TIMEOUT_MS);
 
     const data = await fetchDenganFallback(url, {
         headers,
-        izinkanApiKey: true
+        httpsAgent: getHttpsAgentUntukUrl(url),
+        signal,
+        isJson: Boolean(options.isJson),
+        izinkanApiKey: options.izinkanApiKey !== undefined ? options.izinkanApiKey : true
     });
 
-    if (diblokCF(data)) {
+    if (!options.isJson && diblokCF(data)) {
         throw new Error('Halaman ditolak atau menampilkan challenge Cloudflare.');
     }
 
-    if (typeof data !== 'string' || data.length < 100) {
+    if (typeof data !== 'string' || data.length < (options.isJson ? 2 : 100)) {
         throw new Error('Respons HTML kosong atau terlalu pendek.');
     }
 
@@ -388,7 +684,11 @@ async function ambil(url) {
 
 const inFlightFetch = new Map();
 
-async function fetchWithAntiBlock(targetUrl) {
+async function fetchWithAntiBlock(targetUrl, options = {}) {
+    if (options.signal) {
+        return await ambil(targetUrl, options);
+    }
+
     const existing = inFlightFetch.get(targetUrl);
 
     if (existing) {
@@ -396,7 +696,7 @@ async function fetchWithAntiBlock(targetUrl) {
     }
 
     const request = (async () => {
-        return await ambil(targetUrl);
+        return await ambil(targetUrl, options);
     })();
 
     inFlightFetch.set(targetUrl, request);
@@ -408,6 +708,388 @@ async function fetchWithAntiBlock(targetUrl) {
             inFlightFetch.delete(targetUrl);
         }
     }
+}
+
+// ================= PARSER UNIVERSAL DARI SCRAPER.JS =================
+
+function parseSG4DHistory(jsonData, requestedDate) {
+    const drawList = jsonData?.result?.draw4d;
+    if (!Array.isArray(drawList) || drawList.length === 0) {
+        throw new Error('SG4D History: data draw4d kosong.');
+    }
+
+    const draw = drawList.find(item => String(item?.date || '') === String(requestedDate));
+    if (!draw) {
+        const latestDate = drawList[0]?.date || 'unknown';
+        throw new Error(`SG4D Result belum update (Diminta: ${requestedDate}, API: ${latestDate})`);
+    }
+
+    const prizeRows = Array.isArray(draw.n) ? draw.n : [];
+    if (prizeRows.length === 0) {
+        throw new Error('SG4D History: array n kosong.');
+    }
+
+    const findPrize = position => {
+        const item = prizeRows.find(row => String(row?.p || '').toUpperCase() === position);
+        return item?.i != null ? String(item.i) : null;
+    };
+
+    const p1 = findPrize('T1');
+    const p2 = findPrize('T2');
+    const p3 = findPrize('T3');
+
+    if (!p1 || !p2 || !p3) {
+        throw new Error('SG4D History: Prize T1/T2/T3 belum lengkap.');
+    }
+
+    return { p1, p2, p3, drawDate: draw.date };
+}
+
+function ekstrakGambarBola($, selector) {
+    let numStr = '';
+    $(selector)
+        .first()
+        .find('img')
+        .each((_, el) => {
+            const src = $(el).attr('src');
+            if (src) {
+                const match = src.match(/_(\d)\.jpg/i);
+                if (match) numStr += match[1];
+            }
+        });
+    return numStr;
+}
+
+function ekstrakSelectorHtml($, selector, src) {
+    const isImageBallWeb =
+        Boolean(src.gambar) ||
+        (src.url && (src.url.includes('magnumcambodia.com') || src.url.includes('sydneypoolstoday.com')));
+
+    if (isImageBallWeb) {
+        return ekstrakGambarBola($, selector);
+    }
+
+    if (src.gabung) {
+        return $(selector)
+            .map((_, el) => $(el).text().trim())
+            .get()
+            .join('');
+    }
+
+    return $(selector).first().text().trim();
+}
+
+async function ambilDanParseSumber(src, opsi = {}) {
+    const {
+        signal = null,
+        izinkanApiKey = true,
+        isMacau = false,
+        jamMacau = null,
+        digits = 4,
+        position = 'LAST'
+    } = opsi;
+
+    const signalTerbatas = gabungSignal(signal, FETCH_TIMEOUT_MS);
+
+    let requestBaseUrl = src.url;
+    if (src.sourceType === 'sg4d-history') {
+        const sep = requestBaseUrl.includes('?') ? '&' : '?';
+        requestBaseUrl = `${requestBaseUrl}${sep}d=${getWIBDateString()}`;
+    }
+
+    const url =
+        requestBaseUrl +
+        (requestBaseUrl.includes('?') ? '&' : '?') +
+        '_=' +
+        Date.now();
+
+    const isHijau = Boolean(src.hijau) || src.url.includes('livedrawhijau.org');
+
+    const headers = {
+        'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        'Referer': src.url,
+        'Accept':
+            'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/json',
+        'Accept-Language': 'id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7',
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache',
+        'Sec-Ch-Ua': '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+        'Sec-Ch-Ua-Mobile': '?0',
+        'Sec-Ch-Ua-Platform': '"Windows"',
+        ...(isHijau
+            ? {
+                'X-Requested-With': 'XMLHttpRequest',
+                'Referer':
+                    'https://livedrawhijau.org/' +
+                    new URL(src.url).pathname.split('/')[1] +
+                    '/'
+            }
+            : {})
+    };
+
+    const data = await fetchDenganFallback(url, {
+        headers,
+        httpsAgent: getHttpsAgentUntukUrl(url),
+        signal: signalTerbatas,
+        isJson: isHijau || Boolean(src.isJson),
+        izinkanApiKey
+    });
+
+    if (!data || typeof data !== 'string') {
+        throw new Error('Response kosong.');
+    }
+
+    let jsonData = null;
+    let textData = data.trim();
+
+    if (textData.startsWith('<')) {
+        if (diblokCF(textData)) {
+            throw new Error('diblokir Cloudflare');
+        }
+        const $pre = cheerio.load(textData);
+        const inner = $pre('pre').text().trim() || $pre('body').text().trim();
+        if (inner.startsWith('{') || inner.startsWith('[')) {
+            try {
+                jsonData = JSON.parse(inner);
+            } catch {}
+        }
+    } else if (textData.startsWith('{') || textData.startsWith('[')) {
+        try {
+            jsonData = JSON.parse(textData);
+        } catch {}
+    }
+
+    const rawDataString = jsonData ? JSON.stringify(jsonData) : data;
+
+    let raw = null;
+    let p1_raw = null;
+    let p2_raw = null;
+    let p3_raw = null;
+    let drawDate = null;
+
+    if (jsonData) {
+        if (src.sourceType === 'sg4d-history') {
+            const parsed = parseSG4DHistory(jsonData, getWIBDateString());
+            p1_raw = parsed.p1;
+            p2_raw = parsed.p2;
+            p3_raw = parsed.p3;
+            raw = p1_raw;
+            drawDate = parsed.drawDate;
+        } else if (
+            jsonData.Special_Prize ||
+            (jsonData.Grand_Prize && Array.isArray(jsonData.Grand_Prize))
+        ) {
+            const mainPrize = jsonData.Special_Prize || jsonData.Grand_Prize;
+            p1_raw = Array.isArray(mainPrize) ? mainPrize.join('') : String(mainPrize);
+            raw = p1_raw;
+
+            if (jsonData.Grand_Prize && jsonData.Special_Prize) {
+                p2_raw = Array.isArray(jsonData.Grand_Prize)
+                    ? jsonData.Grand_Prize.join('')
+                    : String(jsonData.Grand_Prize);
+            } else if (jsonData.Second_Prize) {
+                p2_raw = Array.isArray(jsonData.Second_Prize)
+                    ? jsonData.Second_Prize.join('')
+                    : String(jsonData.Second_Prize);
+            }
+
+            if (jsonData.Third_Prize) {
+                p3_raw = Array.isArray(jsonData.Third_Prize)
+                    ? jsonData.Third_Prize.join('')
+                    : String(jsonData.Third_Prize);
+            }
+
+            drawDate = jsonData.draw_date || jsonData.date || jsonData.tanggal || null;
+        } else if (jsonData.p1) {
+            p1_raw = String(jsonData.p1);
+            raw = p1_raw;
+            if (jsonData.p2) p2_raw = String(jsonData.p2);
+            if (jsonData.p3) p3_raw = String(jsonData.p3);
+            drawDate = jsonData.date || jsonData.tanggal || null;
+        } else if (jsonData.result) {
+            p1_raw = String(jsonData.result);
+            raw = p1_raw;
+            drawDate = jsonData.date || jsonData.tanggal || null;
+        } else if (jsonData.data && jsonData.data.first_place) {
+            p1_raw = String(jsonData.data.first_place).replace(/,/g, '');
+            raw = p1_raw;
+            if (jsonData.data.second_place) {
+                p2_raw = String(jsonData.data.second_place).replace(/,/g, '');
+            }
+            if (jsonData.data.third_place) {
+                p3_raw = String(jsonData.data.third_place).replace(/,/g, '');
+            }
+            if (jsonData.date) drawDate = jsonData.date;
+        } else if (jsonData.hk_1st) {
+            p1_raw = String(jsonData.hk_1st);
+            raw = p1_raw;
+            if (jsonData.hk_2nd) p2_raw = String(jsonData.hk_2nd);
+            if (jsonData.hk_3rd) p3_raw = String(jsonData.hk_3rd);
+            if (jsonData.hk_date) drawDate = jsonData.hk_date;
+        } else if (
+            jsonData.success === true &&
+            Array.isArray(jsonData.data) &&
+            jsonData.data.length > 0 &&
+            jsonData.data[0].today_results &&
+            jsonData.data[0].today_results.results
+        ) {
+            const resultsObj = jsonData.data[0].today_results.results;
+            const resultKeys = Object.keys(resultsObj);
+            if (resultKeys.length > 0) {
+                p1_raw = String(resultsObj[resultKeys[0]]);
+                raw = p1_raw;
+            }
+            if (jsonData.data[0].today_results.date) {
+                drawDate = jsonData.data[0].today_results.date;
+            }
+        } else if (jsonData.status === 'sukses' && jsonData.angka_keluar) {
+            p1_raw = String(jsonData.angka_keluar);
+            raw = p1_raw;
+            if (jsonData.tanggal_wib) drawDate = jsonData.tanggal_wib;
+        } else if (Array.isArray(jsonData) && jsonData[0]?.prize1) {
+            const d = jsonData[0];
+            p1_raw = String(d.prize1).replace(/\D/g, '');
+            raw = p1_raw;
+            if (d.prize2) p2_raw = String(d.prize2).replace(/\D/g, '');
+            if (d.prize3) p3_raw = String(d.prize3).replace(/\D/g, '');
+            if (d.tanggal) drawDate = d.tanggal;
+        } else if (jsonData.status === 'belum_update') {
+            throw new Error(jsonData.pesan || 'Belum update.');
+        } else {
+            throw new Error('Format JSON tidak memiliki key prize yang dikenali.');
+        }
+    } else {
+        if (data.length < 100) {
+            throw new Error('respons kosong');
+        }
+        if (diblokCF(data)) {
+            throw new Error('diblokir Cloudflare');
+        }
+
+        const $ = cheerio.load(data);
+
+        if (src.prizeSelectors) {
+            if (src.prizeSelectors.p1) {
+                p1_raw = ekstrakSelectorHtml($, src.prizeSelectors.p1, src);
+            }
+            if (src.prizeSelectors.p2) {
+                p2_raw = ekstrakSelectorHtml($, src.prizeSelectors.p2, src);
+            }
+            if (src.prizeSelectors.p3) {
+                p3_raw = ekstrakSelectorHtml($, src.prizeSelectors.p3, src);
+            }
+            raw = p1_raw;
+
+            if (src.prizeSelectors.p1 && !String(p1_raw || '').replace(/\D/g, '')) {
+                throw new Error('Prize 1 kosong atau selector tidak menemukan data.');
+            }
+            if (src.prizeSelectors.p2 && !String(p2_raw || '').replace(/\D/g, '')) {
+                throw new Error('Prize 2 kosong atau selector tidak menemukan data.');
+            }
+            if (src.prizeSelectors.p3 && !String(p3_raw || '').replace(/\D/g, '')) {
+                throw new Error('Prize 3 kosong atau selector tidak menemukan data.');
+            }
+        } else {
+            if (src.selector) {
+                raw = ekstrakSelectorHtml($, src.selector, src);
+            }
+            if (!raw) {
+                raw =
+                    $('.resultTable2').text().trim() ||
+                    $('.outerbox').text().trim();
+            }
+            p1_raw = raw;
+        }
+    }
+
+    if (!raw) {
+        throw new Error('Result kosong.');
+    }
+
+    // ================= VALIDASI TANGGAL & JAM (SAMA PERSIS SCRAPER.JS) =================
+    if (isMacau) {
+        let dateVerified = false;
+
+        if (jsonData && jsonData.tanggal_wib) {
+            drawDate = String(jsonData.tanggal_wib);
+            dateVerified = hasExactWIBDate(drawDate);
+        } else {
+            const dateMatch = String(rawDataString).match(
+                /(Senin|Selasa|Rabu|Kamis|Jumat|Sabtu|Minggu),?\s+\d{1,2}\s+\w+\.?,?\s+\d{4}/i
+            );
+            if (dateMatch) {
+                drawDate = dateMatch[0];
+                dateVerified = hasExactWIBDate(drawDate);
+            } else {
+                dateVerified = hasExactWIBDate(rawDataString);
+            }
+        }
+
+        if (!dateVerified) {
+            throw new Error(
+                `Tanggal Macau tidak cocok untuk WIB hari ini (${drawDate || 'tidak ditemukan'})`
+            );
+        }
+
+        if (jamMacau && !jsonData && !src.url.includes('livedrawterkini')) {
+            const pageText = cheerio
+                .load(String(rawDataString))
+                .text()
+                .replace(/\s+/g, ' ');
+
+            const slot = getMacauSlotValue(pageText, jamMacau);
+            const rawLast4 = String(raw).replace(/\D/g, '').slice(-4);
+
+            if (slot && rawLast4 && slot !== rawLast4) {
+                throw new Error(`Nomor tidak cocok dengan kolom jadwal ${jamMacau}.`);
+            }
+        }
+    } else if (src.sourceType === 'sg4d-history') {
+        if (!drawDate) {
+            throw new Error('SG4D History: tanggal draw kosong.');
+        }
+    } else {
+        const cekTeksTanggal = drawDate ? `${drawDate} ${rawDataString}` : rawDataString;
+        if (!isDateValid(cekTeksTanggal)) {
+            throw new Error('Tanggal belum update.');
+        }
+    }
+
+    // ================= FORMATTING DIGIT (LAST / FIRST) =================
+    const formatDigits = val => {
+        if (!val) return null;
+        const clean = String(val).replace(/\D/g, '');
+        if (!clean) return null;
+        return position === 'LAST' ? clean.slice(-digits) : clean.slice(0, digits);
+    };
+
+    const result = formatDigits(raw);
+    if (!result || result.length !== digits) {
+        throw new Error(`Digit tidak sesuai (Dapat: ${result || 'kosong'})`);
+    }
+
+    const cp1 = formatDigits(p1_raw) || result;
+    const cp2 = formatDigits(p2_raw);
+    const cp3 = formatDigits(p3_raw);
+
+    if (src.prizeSelectors?.p1 && (!cp1 || cp1.length !== digits)) {
+        throw new Error(`Prize 1 tidak valid (Dapat: ${cp1 || 'kosong'})`);
+    }
+    if (src.prizeSelectors?.p2 && (!cp2 || cp2.length !== digits)) {
+        throw new Error(`Prize 2 tidak valid (Dapat: ${cp2 || 'kosong'})`);
+    }
+    if (src.prizeSelectors?.p3 && (!cp3 || cp3.length !== digits)) {
+        throw new Error(`Prize 3 tidak valid (Dapat: ${cp3 || 'kosong'})`);
+    }
+
+    return {
+        p1: cp1,
+        p2: cp2,
+        p3: cp3,
+        drawDate,
+        sumber: hostDari(src.url)
+    };
 }
 
 // ================= SUMBER RESMI FLORIDA =================
@@ -427,7 +1109,8 @@ async function ambilFloridaResmi(kunci) {
             'Origin': 'https://floridalottery.com',
             'Referer': 'https://floridalottery.com/'
         },
-        timeout: 8000
+        httpsAgent: httpsAgentAman,
+        timeout: FETCH_TIMEOUT_MS
     });
 
     const list = Array.isArray(respons.data)
@@ -468,44 +1151,44 @@ async function ambilNewYorkResmi(kunci) {
     const periodTarget = NY_TIPE_INTERNAL[kunci];
     if (!periodTarget) return null;
 
-    try {
-        const respons = await axios.get(NY_INTERNAL_API, {
-            headers: getRandomHeaders(),
-            timeout: 8000
-        });
+    const respons = await axios.get(NY_INTERNAL_API, {
+        headers: getRandomHeaders(),
+        httpsAgent: httpsAgentAman,
+        timeout: FETCH_TIMEOUT_MS
+    });
 
-        const dataRoot = respons.data.data ? respons.data.data : respons.data;
+    const dataRoot = respons.data.data ? respons.data.data : respons.data;
 
-        if (!dataRoot || !dataRoot.win4 || !Array.isArray(dataRoot.win4.draws)) {
-            return null;
-        }
-
-        const hasil = dataRoot.win4.draws
-            .filter(x => x.drawPeriod === periodTarget && x.results && x.results.length > 0)
-            .map(x => {
-                const tglObj = new Date(x.resultDate);
-                const { y, m, d } = partsInTZ(tglObj, 'America/New_York');
-                const angkaArray = x.results[0].primary;
-
-                return {
-                    tgl: { y, m, d },
-                    angka: angkaArray
-                };
-            })
-            .filter(x => x && x.angka.length === 4)
-            .sort((a, b) => iso(b.tgl).localeCompare(iso(a.tgl)));
-
-        return hasil[0] || null;
-    } catch (error) {
+    if (!dataRoot || !dataRoot.win4 || !Array.isArray(dataRoot.win4.draws)) {
         return null;
     }
+
+    const hasil = dataRoot.win4.draws
+        .filter(x => x.drawPeriod === periodTarget && x.results && x.results.length > 0)
+        .map(x => {
+            const tglObj = new Date(x.resultDate);
+            const { y, m, d } = partsInTZ(tglObj, 'America/New_York');
+            const angkaArray = x.results[0].primary;
+
+            return {
+                tgl: { y, m, d },
+                angka: angkaArray
+            };
+        })
+        .filter(x => x && x.angka.length === 4)
+        .sort((a, b) => iso(b.tgl).localeCompare(iso(a.tgl)));
+
+    return hasil[0] || null;
 }
 
-// ================= CACHE HASIL VALID =================
+// ================= CACHE HASIL VALID & CACHE SINGKAT BELUM UPDATE =================
 
 const okCache = new Map();
 const OK_TTL_MS = 5 * 60 * 1000;
 const CACHE_MAX_ENTRIES = 200;
+
+const belumUpdateCache = new Map();
+const BELUM_UPDATE_TTL_MS = 2500;
 
 function getCache(key) {
     const item = okCache.get(key);
@@ -521,6 +1204,8 @@ function getCache(key) {
 }
 
 function setCache(key, value) {
+    belumUpdateCache.delete(key);
+
     for (const [cacheKey, item] of okCache.entries()) {
         if (Date.now() - item.t >= OK_TTL_MS) {
             okCache.delete(cacheKey);
@@ -546,6 +1231,23 @@ function setCache(key, value) {
     });
 }
 
+function getBelumUpdateCache(key) {
+    const item = belumUpdateCache.get(key);
+    if (!item) return null;
+    if (Date.now() - item.t >= BELUM_UPDATE_TTL_MS) {
+        belumUpdateCache.delete(key);
+        return null;
+    }
+    return item.v;
+}
+
+function setBelumUpdateCache(key, value) {
+    belumUpdateCache.set(key, {
+        t: Date.now(),
+        v: value
+    });
+}
+
 function bentukRespons(full, debug) {
     if (debug) return full;
 
@@ -559,7 +1261,6 @@ function bentukRespons(full, debug) {
         p3
     } = full;
 
-    // Masukkan langsung p1, p2, p3 ke root JSON jika ada (untuk HK Pools)
     if (p1 !== undefined) {
         return { status, pasaran, tanggal_wib, p1, p2, p3 };
     }
@@ -567,7 +1268,7 @@ function bentukRespons(full, debug) {
     return { status, pasaran, tanggal_wib, angka_keluar };
 }
 
-// ================= HELPER PARSER HASIL =================
+// ================= HELPER PARSER LOTTERYUSA =================
 function isFireball($, element) {
     const cls = ($(element).attr('class') || '').toLowerCase();
 
@@ -635,7 +1336,6 @@ function cariTanggalRaw($, mulai) {
 }
 
 // ================= HELPER HK POOLS =================
-// URL sumber disesuaikan dengan situs HTML yang diberikan.
 const HKPOOLS_URL = 'https://hkpools1.com/';
 
 const HKPOOLS_LABEL = {
@@ -679,8 +1379,6 @@ function cariBagianHkPools($, market) {
         ? 'HKPOOLS DAY'
         : 'HKPOOLS NIGHT';
 
-    // Struktur HTML sumber: judul berada di dalam elemen <b>
-    // dan masing-masing pasaran berada pada .col-md-6.
     const kolom = $('.col-md-6').filter(function () {
         const teks = $(this)
             .text()
@@ -699,7 +1397,6 @@ function cariBagianHkPools($, market) {
 
     if (kolom.length) return kolom;
 
-    // Fallback jika kelas kolom berubah.
     let judul = null;
 
     $('b').each((_, el) => {
@@ -748,8 +1445,6 @@ function ambilTanggalHkPools($, bagian) {
 }
 
 function ambilNomorEnamDigitHkPools($, row) {
-    // Sumber menggunakan enam elemen span.ball-1, span.ball-2,
-    // atau span.ball-3 untuk setiap hadiah.
     const bola = row.find(
         'span.ball-1, span.ball-2, span.ball-3'
     );
@@ -773,11 +1468,9 @@ function ambilNomorEnamDigitHkPools($, row) {
             return nomor;
         }
 
-        // Jangan mengambil angka dari teks X atau placeholder lainnya.
         return null;
     }
 
-    // Fallback untuk variasi markup yang menyimpan angka pada sel.
     const teks = row.find('td').last().text().replace(/\s+/g, ' ').trim();
     const digit = teks.replace(/\D/g, '');
 
@@ -792,7 +1485,6 @@ function ambilHadiahHkPools($, bagian, label) {
 
         const row = $(el);
 
-        // Label hadiah berada pada td yang berisi b.
         const labelTeks = row.find('td').first()
             .text()
             .replace(/\s+/g, ' ')
@@ -840,17 +1532,12 @@ function parseHkPools(html, market) {
     };
 }
 
-// ================= NEW ZEALAND BULLSEYE =================
+// ================= NEW ZEALAND BULLSEYE (BALAPAN TERCEPAT: TOGEL-ONLINE.CC + MYLOTTO.CO.NZ) =================
 
 const BULLSEYE_API =
     'https://pathway.mylotto.co.nz/api/results/v1/results/bullseye';
 
 const BULLSEYE_TZ = 'Pacific/Auckland';
-const BULLSEYE_CACHE_TTL = 60 * 1000;
-
-let bullseyeCache = null;
-let bullseyeCacheTime = 0;
-let bullseyeInFlight = null;
 
 function getBullseyeHeaders() {
     return {
@@ -865,8 +1552,6 @@ function getBullseyeHeaders() {
         'LNZ-REQUEST-ID': randomUUID()
     };
 }
-
-// ================= VALIDASI BULLSEYE =================
 
 function validasiBullseye(drawDate, drawTime, waktuUndian) {
     if (!tanggalValid(drawDate)) {
@@ -891,7 +1576,6 @@ function validasiBullseye(drawDate, drawTime, waktuUndian) {
         throw new Error('Jam undian Bullseye tidak valid.');
     }
 
-    // Jadwal Bullseye sekitar pukul 18:00 Auckland.
     if (
         totalMenit < 17 * 60 + 55 ||
         totalMenit > 18 * 60 + 15
@@ -901,7 +1585,6 @@ function validasiBullseye(drawDate, drawTime, waktuUndian) {
         );
     }
 
-    // Waktu sekarang di Selandia Baru.
     const formatter = new Intl.DateTimeFormat('en-GB', {
         timeZone: BULLSEYE_TZ,
         year: 'numeric',
@@ -940,7 +1623,6 @@ function validasiBullseye(drawDate, drawTime, waktuUndian) {
         String(kemarin.getUTCDate()).padStart(2, '0')
     ].join('-');
 
-    // Validasi tanggal hasil berdasarkan jadwal undian.
     if (sekarangMenit < 18 * 60) {
         if (drawDate !== tanggalKemarin) {
             throw new Error(
@@ -954,7 +1636,6 @@ function validasiBullseye(drawDate, drawTime, waktuUndian) {
             );
         }
     } else {
-        // Masa transisi pengundian.
         if (
             drawDate !== tanggalSekarang &&
             drawDate !== tanggalKemarin
@@ -965,7 +1646,6 @@ function validasiBullseye(drawDate, drawTime, waktuUndian) {
         }
     }
 
-    // Tolak waktu undian yang berada terlalu jauh di masa depan.
     if (waktuUndian.getTime() > Date.now() + 5 * 60 * 1000) {
         throw new Error(
             'Waktu undian Bullseye berada di masa depan.'
@@ -975,128 +1655,124 @@ function validasiBullseye(drawDate, drawTime, waktuUndian) {
     return true;
 }
 
-// ================= AMBIL HASIL BULLSEYE =================
-
-async function ambilBullseye() {
-    if (
-        bullseyeCache &&
-        Date.now() - bullseyeCacheTime < BULLSEYE_CACHE_TTL
-    ) {
-        return bullseyeCache;
-    }
-
-    if (bullseyeInFlight) {
-        return bullseyeInFlight;
-    }
-
-    bullseyeInFlight = (async () => {
-        try {
-            const response = await axios.get(BULLSEYE_API, {
-                headers: getBullseyeHeaders(),
-                timeout: 10000,
-                params: {
-                    _: Date.now()
-                }
-            });
-
-            const raw = response.data;
-
-            if (!raw || typeof raw !== 'object') {
-                throw new Error(
-                    'Respons Bullseye bukan JSON yang valid.'
-                );
-            }
-
-            // Hasil resmi terdiri dari enam digit.
-            const angkaEnamDigit = String(
-                raw.bullseyeWinningNumbers?.numbers ?? ''
-            );
-
-            if (!/^\d{6}$/.test(angkaEnamDigit)) {
-                throw new Error(
-                    'Angka Bullseye tidak ditemukan atau bukan enam digit.'
-                );
-            }
-
-            const drawDate = String(raw.drawDate || '');
-            const drawTime = String(raw.drawTime || '');
-
-            const tanggalMatch = drawDate.match(
-                /^(\d{4})-(\d{2})-(\d{2})/
-            );
-
-            const waktuMatch = drawTime.match(
-                /^(\d{1,2}):(\d{2})$/
-            );
-
-            if (!tanggalMatch || !waktuMatch) {
-                throw new Error(
-                    'Format tanggal atau waktu undian Bullseye tidak dikenali.'
-                );
-            }
-
-            const tahun = Number(tanggalMatch[1]);
-            const bulan = Number(tanggalMatch[2]);
-            const hari = Number(tanggalMatch[3]);
-            const jam = Number(waktuMatch[1]);
-            const menit = Number(waktuMatch[2]);
-
-            const tanggalISO =
-                `${tahun}-${String(bulan).padStart(2, '0')}-${String(hari).padStart(2, '0')}`;
-
-            if (!tanggalValid(tanggalISO)) {
-                throw new Error(
-                    'Tanggal kalender Bullseye tidak valid.'
-                );
-            }
-
-            if (jam > 23 || menit > 59) {
-                throw new Error(
-                    'Jam undian Bullseye tidak valid.'
-                );
-            }
-
-            // Konversi waktu Auckland ke WIB.
-            const waktuUndian = localToDate(
-                tahun,
-                bulan,
-                hari,
-                jam,
-                menit,
-                BULLSEYE_TZ
-            );
-
-            // VALIDASI WAJIB SEBELUM HASIL DITERIMA.
-            validasiBullseye(
-                tanggalISO,
-                drawTime,
-                waktuUndian
-            );
-
-            const payload = {
-                status: 'sukses',
-                pasaran: 'NEW ZEALAND BULLSEYE',
-                tanggal_wib: getTanggalWIB(waktuUndian),
-                waktu_undian_wib: jamWIB(waktuUndian),
-                tanggal_undian_nz: tanggalISO,
-                zona_undian: BULLSEYE_TZ,
-                draw_number: raw.drawNumber ?? null,
-                angka_keluar: angkaEnamDigit.slice(-4)
-            };
-
-            bullseyeCache = payload;
-            bullseyeCacheTime = Date.now();
-
-            return payload;
-
-        } finally {
-            bullseyeInFlight = null;
+async function ambilBullseyeResmi(signal) {
+    const response = await axios.get(BULLSEYE_API, {
+        headers: getBullseyeHeaders(),
+        httpsAgent: httpsAgentAman,
+        timeout: FETCH_TIMEOUT_MS,
+        signal,
+        params: {
+            _: Date.now()
         }
-    })();
+    });
 
-    return bullseyeInFlight;
+    const raw = response.data;
+
+    if (!raw || typeof raw !== 'object') {
+        throw new Error('Respons Bullseye bukan JSON yang valid.');
+    }
+
+    const angkaEnamDigit = String(
+        raw.bullseyeWinningNumbers?.numbers ?? ''
+    );
+
+    if (!/^\d{6}$/.test(angkaEnamDigit)) {
+        throw new Error('Angka Bullseye tidak ditemukan atau bukan enam digit.');
+    }
+
+    const drawDate = String(raw.drawDate || '');
+    const drawTime = String(raw.drawTime || '');
+
+    const tanggalMatch = drawDate.match(/^(\d{4})-(\d{2})-(\d{2})/);
+    const waktuMatch = drawTime.match(/^(\d{1,2}):(\d{2})$/);
+
+    if (!tanggalMatch || !waktuMatch) {
+        throw new Error('Format tanggal atau waktu undian Bullseye tidak dikenali.');
+    }
+
+    const tahun = Number(tanggalMatch[1]);
+    const bulan = Number(tanggalMatch[2]);
+    const hari = Number(tanggalMatch[3]);
+    const jam = Number(waktuMatch[1]);
+    const menit = Number(waktuMatch[2]);
+
+    const tanggalISO =
+        `${tahun}-${String(bulan).padStart(2, '0')}-${String(hari).padStart(2, '0')}`;
+
+    if (!tanggalValid(tanggalISO)) {
+        throw new Error('Tanggal kalender Bullseye tidak valid.');
+    }
+
+    if (jam > 23 || menit > 59) {
+        throw new Error('Jam undian Bullseye tidak valid.');
+    }
+
+    const waktuUndian = localToDate(
+        tahun,
+        bulan,
+        hari,
+        jam,
+        menit,
+        BULLSEYE_TZ
+    );
+
+    validasiBullseye(tanggalISO, drawTime, waktuUndian);
+
+    return {
+        status: 'sukses',
+        pasaran: 'NEW ZEALAND BULLSEYE',
+        tanggal_wib: getTanggalWIB(waktuUndian),
+        waktu_undian_wib: jamWIB(waktuUndian),
+        tanggal_undian_nz: tanggalISO,
+        zona_undian: BULLSEYE_TZ,
+        draw_number: raw.drawNumber ?? null,
+        sumber: 'mylotto.co.nz',
+        angka_keluar: angkaEnamDigit.slice(-4)
+    };
 }
 
+async function ambilBullseye() {
+    const isoWib = iso(partsInTZ(new Date(), 'Asia/Jakarta'));
+    const cacheKey = `bullseye_${isoWib}`;
+
+    const hit = getCache(cacheKey);
+    if (hit) return hit;
+
+    const hitBelum = getBelumUpdateCache(cacheKey);
+    if (hitBelum) {
+        throw new Error(hitBelum.pesan);
+    }
+
+    const ctrl = new AbortController();
+
+    try {
+        const menang = await Promise.any([
+            // Jalur 1: Sumber tercepat di config.js kamu
+            ambilDanParseSumber(
+                { url: 'https://togel-online.cc/livedraw/bullseye', selector: 'p.text-gold' },
+                { signal: ctrl.signal, izinkanApiKey: true }
+            ).then(res => ({
+                status: 'sukses',
+                pasaran: 'NEW ZEALAND BULLSEYE',
+                tanggal_wib: getTanggalWIB(),
+                waktu_undian_wib: '13:05 WIB',
+                sumber: res.sumber,
+                angka_keluar: res.p1
+            })),
+            // Jalur 2: API resmi mylotto.co.nz
+            ambilBullseyeResmi(ctrl.signal)
+        ]);
+
+        ctrl.abort();
+        setCache(cacheKey, menang);
+        return menang;
+    } catch (aggErr) {
+        ctrl.abort();
+        const pesan = aggErr?.errors?.map(e => e.message).join(' | ') || 'Belum update.';
+        setBelumUpdateCache(cacheKey, { pesan });
+        throw new Error(pesan);
+    }
+}
 
 // ================= DASHBOARD =================
 app.get('/', (req, res) => {
@@ -1153,11 +1829,9 @@ app.get('/', (req, res) => {
                     <a href="/api/result/hk-pools/night" target="_blank">Hongkong Night</a>
                 </div>
                 <div class="market-card">
-    <h2>🇳🇿 Bullseye</h2>
-    <a href="/api/result/bullseye" target="_blank">
-        Bullseye
-    </a>
-</div>
+                    <h2>🇳🇿 Bullseye</h2>
+                    <a href="/api/result/bullseye" target="_blank">Bullseye</a>
+                </div>
                 <div class="market-card">
                     <h2>🇹🇼 Taiwan</h2>
                     <a href="/api/result/taiwan" target="_blank">Taiwan</a>
@@ -1242,6 +1916,7 @@ app.get('/', (req, res) => {
                     <a href="/api/result/hk" target="_blank">Hongkong</a>
                     <a href="/api/result/hk-lotto" target="_blank">Hongkong Lotto</a>
                     <a href="/api/result/sgp4d" target="_blank">Singapore 4D</a>
+                    <a href="/api/result/sgp-toto" target="_blank">Singapore Toto</a>
                     <a href="/api/result/sydney" target="_blank">Sydney Pools</a>
                     <a href="/api/result/sydney-lotto" target="_blank">Sydney Lotto</a>
                     <a href="/api/result/china" target="_blank">Cina</a>
@@ -1260,7 +1935,127 @@ app.get('/', (req, res) => {
     res.send(html);
 });
 
-// ================= ENDPOINT TOTO MACAU PER JAM =================
+// ================= TOTO MACAU (HANYA SUMBER TERCEPAT DI LOG) =================
+const MACAU_SUMBER_TERCEPAT = {
+    '00:00': [
+        { url: 'https://livedrawmacau.sbs/ldmacau.php', selector: 'table.satu tr:nth-child(3) td.warnaisi' },
+        { url: 'https://68.183.227.182/live-draw-togel/totomacau-live.php', selector: 'table:nth-of-type(2) tbody tr:nth-child(3) td:nth-child(1)' }
+    ],
+    '13:00': [
+        { url: 'https://livedrawmacau.sbs/ldmacau.php', selector: 'table.satu tr:nth-child(4) td.warnaisi' },
+        { url: 'https://68.183.227.182/live-draw-togel/totomacau-live.php', selector: 'table:nth-of-type(2) tbody tr:nth-child(3) td:nth-child(2)' }
+    ],
+    '16:00': [
+        { url: 'https://livedrawmacau.sbs/ldmacau.php', selector: 'table.satu tr:nth-child(5) td.warnaisi' },
+        { url: 'https://68.183.227.182/live-draw-togel/totomacau-live.php', selector: 'table:nth-of-type(2) tbody tr:nth-child(3) td:nth-child(3)' }
+    ],
+    '19:00': [
+        { url: 'https://livedrawmacau.sbs/ldmacau.php', selector: 'table.satu tr:nth-child(6) td.warnaisi' },
+        { url: 'https://68.183.227.182/live-draw-togel/totomacau-live.php', selector: 'table:nth-of-type(2) tbody tr:nth-child(3) td:nth-child(4)' }
+    ],
+    '22:00': [
+        { url: 'https://livedrawmacau.sbs/ldmacau.php', selector: 'table.satu tr:nth-child(7) td.warnaisi' },
+        { url: 'https://68.183.227.182/live-draw-togel/totomacau-live.php', selector: 'table:nth-of-type(2) tbody tr:nth-child(3) td:nth-child(5)' }
+    ],
+    '23:00': [
+        { url: 'https://livedrawmacau.sbs/ldmacau.php', selector: 'table.satu tr:nth-child(8) td.warnaisi' },
+        { url: 'https://68.183.227.182/live-draw-togel/totomacau-live.php', selector: 'table:nth-of-type(2) tbody tr:nth-child(3) td:nth-child(6)' }
+    ]
+};
+
+function formatTanggalWibLengkap() {
+    const { y, m, d } = partsInTZ(new Date(), 'Asia/Jakarta');
+    return `${d} ${BULAN_INGGRIS[m - 1]} ${y}`;
+}
+
+async function prosesMacau(targetJam) {
+    const wibHariIni = partsInTZ(new Date(), 'Asia/Jakarta');
+    const isoWib = iso(wibHariIni);
+    const cacheKey = `macau_${targetJam}_${isoWib}`;
+
+    const hit = getCache(cacheKey);
+    if (hit) return { dariCache: true, data: hit };
+
+    const hitBelum = getBelumUpdateCache(cacheKey);
+    if (hitBelum) return { dariCache: true, data: hitBelum };
+
+    const sumberList = MACAU_SUMBER_TERCEPAT[targetJam] || [];
+    const ctrl = new AbortController();
+    const galat = [];
+
+    const jalankanBalapan = async (izinkanApiKey) => {
+        const tugas = sumberList.map(src =>
+            ambilDanParseSumber(src, {
+                signal: ctrl.signal,
+                izinkanApiKey,
+                isMacau: true,
+                jamMacau: targetJam
+            })
+                .then(res => ({
+                    status: 'sukses',
+                    pasaran: `TOTO MACAU ${targetJam} WIB`,
+                    tanggal_wib: res.drawDate || formatTanggalWibLengkap(),
+                    waktu_undian_wib: `${targetJam} WIB`,
+                    angka_keluar: res.p1,
+                    sumber: res.sumber
+                }))
+                .catch(err => {
+                    galat.push(`${hostDari(src.url)}: ${err.message}`);
+                    throw err;
+                })
+        );
+
+        return await Promise.any(tugas);
+    };
+
+    try {
+        let menang;
+        try {
+            menang = await jalankanBalapan(false);
+            ctrl.abort();
+        } catch (firstErr) {
+            ctrl.abort();
+            const adaBlokir = galat.some(g => /403|407|429|503|cloudflare|ditolak/i.test(g));
+            if (!adaBlokir) throw firstErr;
+
+            const ctrl2 = new AbortController();
+            try {
+                menang = await Promise.any(
+                    sumberList.map(src =>
+                        ambilDanParseSumber(src, {
+                            signal: ctrl2.signal,
+                            izinkanApiKey: true,
+                            isMacau: true,
+                            jamMacau: targetJam
+                        }).then(res => ({
+                            status: 'sukses',
+                            pasaran: `TOTO MACAU ${targetJam} WIB`,
+                            tanggal_wib: res.drawDate || formatTanggalWibLengkap(),
+                            waktu_undian_wib: `${targetJam} WIB`,
+                            angka_keluar: res.p1,
+                            sumber: res.sumber
+                        }))
+                    )
+                );
+            } finally {
+                ctrl2.abort();
+            }
+        }
+
+        setCache(cacheKey, menang);
+        return { dariCache: false, data: menang };
+    } catch (err) {
+        const belumPayload = {
+            status: 'belum_update',
+            pasaran: `TOTO MACAU ${targetJam} WIB`,
+            pesan: `Belum update: Data putaran ${targetJam} untuk tanggal ${isoWib} belum tersedia. (${[...new Set(galat)].join(' | ').slice(0, 220)})`,
+            detail_galat: galat
+        };
+        setBelumUpdateCache(cacheKey, belumPayload);
+        return { dariCache: false, data: belumPayload };
+    }
+}
+
 app.get('/api/result/macau/:sesi', async (req, res) => {
     const { sesi } = req.params;
     const debug = req.query.debug === '1';
@@ -1287,172 +2082,61 @@ app.get('/api/result/macau/:sesi', async (req, res) => {
         });
     }
 
-    const targetUrl = 'https://www.totomacaupools.com/';
+    const hasil = await prosesMacau(targetJam);
+    const payload = hasil.data;
 
-    const wibHariIni = partsInTZ(new Date(), 'Asia/Jakarta');
-    const isoWib = iso(wibHariIni);
-    const cacheKey = `macau_${targetJam}_${isoWib}`;
-
-    const hit = getCache(cacheKey);
-
-    if (hit) {
+    if (payload.status === 'sukses') {
         res.setHeader('Cache-Control', 's-maxage=300, stale-while-revalidate');
-        return res.json(bentukRespons(hit, debug));
+        if (!debug) {
+            const { sumber, detail_galat, ...bersih } = payload;
+            return res.json(bersih);
+        }
+        return res.json(payload);
     }
 
-    try {
-        const html = await fetchWithAntiBlock(targetUrl);
-        const $ = cheerio.load(html);
-
-        let payload = null;
-        let fallback = null;
-
-        $('.resultWrapper .container').each((i, el) => {
-            const judul = $(el)
-                .find('.event span')
-                .text()
-                .toUpperCase();
-
-            if (!judul.includes('4D')) return;
-
-            const waktuRaw = $(el)
-                .find('.calendar .time')
-                .text()
-                .trim();
-
-            const waktuMatch = waktuRaw.match(/(\d{2}:\d{2})/);
-            const jamWeb = waktuMatch ? waktuMatch[1] : '';
-
-            const hari = $(el)
-                .find('.calendar .day')
-                .contents()
-                .first()
-                .text()
-                .trim();
-
-            const bulanStr = $(el)
-                .find('.calendar .month')
-                .contents()
-                .first()
-                .text()
-                .trim()
-                .toLowerCase()
-                .replace(/\.$/, '');
-
-            const tahun = $(el)
-                .find('.calendar .year')
-                .contents()
-                .first()
-                .text()
-                .trim();
-
-            const bulanAngka = MONTHS.indexOf(bulanStr) + 1;
-
-            const tanggalUndian = `${hari} ${bulanStr.toUpperCase()} ${tahun}`;
-
-            const isoWeb = (
-                bulanAngka > 0 &&
-                /^\d{1,2}$/.test(hari) &&
-                /^\d{4}$/.test(tahun)
-            )
-                ? `${tahun}-${String(bulanAngka).padStart(2, '0')}-${String(Number(hari)).padStart(2, '0')}`
-                : '';
-
-            if (!tanggalValid(isoWeb)) return;
-
-            const angkaKeluar = [];
-
-            $(el).find('.results ul li').each((j, li) => {
-                const style = ($(li).attr('style') || '').toLowerCase();
-
-                if (style.includes('display:none') || style.includes('visibility:hidden')) {
-                    return;
-                }
-
-                const imgSrc = $(li).find('img').attr('src') || '';
-                const matchAngka = imgSrc.match(/ball-(\d+)\.png/i);
-
-                if (matchAngka) {
-                    angkaKeluar.push(matchAngka[1]);
-                }
-            });
-
-            if (jamWeb === targetJam && isoWeb === isoWib) {
-                if (angkaKeluar.length === 4) {
-                    payload = {
-                        status: 'sukses',
-                        pasaran: `TOTO MACAU ${targetJam} WIB`,
-                        tanggal_wib: tanggalUndian,
-                        waktu_undian_wib: `${jamWeb} WIB`,
-                        angka_keluar: angkaKeluar.join('')
-                    };
-
-                    return false;
-                }
-
-                if (!fallback) {
-                    fallback = {
-                        status: 'belum_update',
-                        pesan: `Tanggal dan sesi cocok, tetapi jumlah angka yang ditemukan ${angkaKeluar.length}/4.`,
-                        ...(debug ? {
-                            req_jam: targetJam,
-                            req_tgl: isoWib,
-                            web_jam: jamWeb,
-                            web_tgl: isoWeb,
-                            angka_ditemukan: angkaKeluar
-                        } : {})
-                    };
-                }
-
-                return;
-            }
-
-            if (!fallback) {
-                fallback = {
-                    status: 'belum_update',
-                    pesan: `Data putaran ${targetJam} untuk tanggal ${isoWib} belum tersedia. Web menampilkan hasil ${jamWeb || 'tanpa jam'} tanggal ${isoWeb}.`,
-                    ...(debug ? {
-                        req_jam: targetJam,
-                        req_tgl: isoWib,
-                        web_jam: jamWeb,
-                        web_tgl: isoWeb
-                    } : {})
-                };
-            }
-        });
-
-        if (!payload) {
-            payload = fallback;
-        }
-
-        if (!payload) {
-            return res.status(422).json({
-                status: 'error',
-                pesan: 'Gagal menemukan struktur 4D yang memiliki tanggal valid di halaman Toto Macau.',
-                ...(debug ? { url: targetUrl } : {})
-            });
-        }
-
-        if (payload.status === 'sukses') {
-            setCache(cacheKey, payload);
-        }
-
-        res.setHeader('Cache-Control', 's-maxage=300, stale-while-revalidate');
-        return res.json(bentukRespons(payload, debug));
-    } catch (error) {
-        return res.status(502).json({
-            status: 'error',
-            pesan: 'Gagal mengakses website Toto Macau.',
-            detail: error.message,
-            ...(debug ? {
-                url: targetUrl,
-                waktu: dapatkanWaktuWIB()
-            } : {})
-        });
-    }
+    const { detail_galat, ...bersihBelum } = payload;
+    return res.json(debug ? { ...bersihBelum, detail: detail_galat } : bersihBelum);
 });
 
 // ================= ENDPOINT HK POOLS DAY & NIGHT =================
+async function prosesHkPools(market) {
+    const namaPasaran = HKPOOLS_LABEL[market];
+    const cacheKey = `hk-pools-${market}`;
+
+    const hit = getCache(cacheKey);
+    if (hit) return { ok: true, data: hit };
+
+    const hitBelum = getBelumUpdateCache(cacheKey);
+    if (hitBelum) return { ok: false, data: hitBelum };
+
+    const html = await fetchWithAntiBlock(HKPOOLS_URL, { timeoutMs: FETCH_TIMEOUT_MS });
+    const payload = parseHkPools(html, market);
+
+    const hasilLengkap = Boolean(
+        payload.tanggal_wib &&
+        /^\d{4}$/.test(payload.p1 || '') &&
+        /^\d{4}$/.test(payload.p2 || '') &&
+        /^\d{4}$/.test(payload.p3 || '')
+    );
+
+    if (!hasilLengkap) {
+        const belum = {
+            status: 'belum_update',
+            pasaran: namaPasaran,
+            tanggal_wib: payload.tanggal_wib,
+            p1: payload.p1,
+            p2: payload.p2,
+            p3: payload.p3,
+            pesan: 'Hasil belum lengkap atau situs masih menampilkan placeholder.'
+        };
+        setBelumUpdateCache(cacheKey, belum);
+        return { ok: false, data: belum, html };
+    }
+
+    setCache(cacheKey, payload);
+    return { ok: true, data: payload };
+}
+
 app.get('/api/result/hk-pools/:market', async (req, res) => {
     const market = String(req.params.market || '').toLowerCase();
     const debug = req.query.debug === '1';
@@ -1465,48 +2149,24 @@ app.get('/api/result/hk-pools/:market', async (req, res) => {
     }
 
     const namaPasaran = HKPOOLS_LABEL[market];
-    const cacheKey = `hk-pools-${market}`;
-
-    const hit = getCache(cacheKey);
-
-    if (hit) {
-        res.setHeader('Cache-Control', 's-maxage=300, stale-while-revalidate');
-        return res.json(bentukRespons(hit, debug));
-    }
 
     try {
-        const html = await fetchWithAntiBlock(HKPOOLS_URL);
-        const payload = parseHkPools(html, market);
+        const hasil = await prosesHkPools(market);
 
-        const hasilLengkap = Boolean(
-            payload.tanggal_wib &&
-            /^\d{4}$/.test(payload.p1 || '') &&
-            /^\d{4}$/.test(payload.p2 || '') &&
-            /^\d{4}$/.test(payload.p3 || '')
-        );
-
-        if (!hasilLengkap) {
+        if (!hasil.ok) {
             return res.status(503).json({
-                status: 'belum_update',
-                pasaran: namaPasaran,
-                tanggal_wib: payload.tanggal_wib,
-                p1: payload.p1,
-                p2: payload.p2,
-                p3: payload.p3,
-                pesan: 'Hasil belum lengkap atau situs masih menampilkan placeholder.',
-                ...(debug ? {
+                ...hasil.data,
+                ...(debug && hasil.html ? {
                     url: HKPOOLS_URL,
                     market,
-                    judul: cheerio.load(html)('title').text().trim(),
-                    panjang_html: html.length
+                    judul: cheerio.load(hasil.html)('title').text().trim(),
+                    panjang_html: hasil.html.length
                 } : {})
             });
         }
 
-        setCache(cacheKey, payload);
-
         res.setHeader('Cache-Control', 's-maxage=300, stale-while-revalidate');
-        return res.json(bentukRespons(payload, debug));
+        return res.json(bentukRespons(hasil.data, debug));
     } catch (error) {
         console.error(`[HK POOLS ${market.toUpperCase()}]`, error.message);
 
@@ -1523,7 +2183,277 @@ app.get('/api/result/hk-pools/:market', async (req, res) => {
     }
 });
 
-// ================= ENDPOINT HASIL (LOTTERY USA) =================
+// ================= HELPER & ENDPOINT HASIL (US) =================
+async function prosesUSMarket(state, game) {
+    const tz = STATE_TZ[state];
+    const targetGame = GAME_ALIAS[`${state}/${game}`] || game;
+    const targetState = STATE_SLUG[state] || state;
+    const targetUrl = `https://www.lotteryusa.com/${targetState}/${targetGame}/`;
+    const wibHariIniStr = iso(partsInTZ(new Date(), 'Asia/Jakarta'));
+    const cacheKey = `${state}/${game}/${wibHariIniStr}`;
+
+    const hit = getCache(cacheKey);
+    if (hit) return { code: 200, data: hit, targetUrl };
+
+    const hitBelum = getBelumUpdateCache(cacheKey);
+    if (hitBelum) return { code: hitBelum.httpCode || 200, data: hitBelum.body, targetUrl };
+
+    const kunciLotre = `${state}/${game}`;
+    const slot = SLOT_WIB[kunciLotre];
+    const jam = JADWAL[kunciLotre];
+    const cepatBot = US_SUMBER_TERCEPAT[kunciLotre];
+
+    // 1. New York: Balapan API resmi nylottery.ny.gov vs togel-online.cc
+    if (NY_TIPE_INTERNAL[kunciLotre]) {
+        const tugasNY = [
+            ambilNewYorkResmi(kunciLotre).then(hasilNY => {
+                if (!hasilNY) throw new Error('NY resmi kosong');
+                let waktuNY = slot ? slotWIB(hasilNY.tgl, tz, slot) : null;
+                if (!waktuNY) {
+                    const [hhNY, mmNY] = (jam || JAM_DEFAULT).split(':').map(Number);
+                    waktuNY = localToDate(hasilNY.tgl.y, hasilNY.tgl.m, hasilNY.tgl.d, hhNY, mmNY, tz);
+                }
+                if (iso(partsInTZ(waktuNY, 'Asia/Jakarta')) !== wibHariIniStr) {
+                    throw new Error('NY resmi belum update hari ini');
+                }
+                return {
+                    status: 'sukses',
+                    pasaran: game === 'midday-win-4' ? 'MIDDAY WIN 4' : 'WIN 4',
+                    tanggal_wib: getTanggalWIB(waktuNY),
+                    waktu_undian_wib: jamWIB(waktuNY),
+                    tanggal_undian_us: iso(hasilNY.tgl),
+                    zona_undian: tz,
+                    sumber: 'nylottery.ny.gov (API)',
+                    angka_keluar: hasilNY.angka.join('')
+                };
+            })
+        ];
+
+        if (cepatBot) {
+            tugasNY.push(
+                ambilDanParseSumber(cepatBot, { izinkanApiKey: true }).then(resBot => {
+                    const nowWib = new Date();
+                    return {
+                        status: 'sukses',
+                        pasaran: game === 'midday-win-4' ? 'MIDDAY WIN 4' : 'WIN 4',
+                        tanggal_wib: getTanggalWIB(nowWib),
+                        waktu_undian_wib: slot ? `${slot} WIB` : null,
+                        tanggal_undian_us: iso(partsInTZ(nowWib, tz)),
+                        zona_undian: tz,
+                        sumber: resBot.sumber,
+                        angka_keluar: resBot.p1
+                    };
+                })
+            );
+        }
+
+        try {
+            const payloadNY = await Promise.any(tugasNY);
+            setCache(cacheKey, payloadNY);
+            return { code: 200, data: payloadNY, targetUrl };
+        } catch {
+            const bodyNY = { status: 'belum_update', pesan: 'Hasil New York belum update hari ini.' };
+            setBelumUpdateCache(cacheKey, { httpCode: 200, body: bodyNY });
+            return { code: 200, data: bodyNY, targetUrl: NY_INTERNAL_API };
+        }
+    }
+
+    // 2. Florida: Balapan API resmi floridalottery.com vs togel-online.cc
+    if (FL_TIPE[kunciLotre]) {
+        const tugasFL = [
+            ambilFloridaResmi(kunciLotre).then(hasilFl => {
+                if (!hasilFl) throw new Error('FL resmi kosong');
+                let waktuFl = slot ? slotWIB(hasilFl.tgl, tz, slot) : null;
+                if (!waktuFl) {
+                    const [hhFl, mmFl] = (jam || JAM_DEFAULT).split(':').map(Number);
+                    waktuFl = localToDate(hasilFl.tgl.y, hasilFl.tgl.m, hasilFl.tgl.d, hhFl, mmFl, tz);
+                }
+                if (iso(partsInTZ(waktuFl, 'Asia/Jakarta')) !== wibHariIniStr) {
+                    throw new Error('FL resmi belum update hari ini');
+                }
+                return {
+                    status: 'sukses',
+                    pasaran: game === 'pick-4-midday' ? 'MIDDAY PICK 4' : 'PICK 4',
+                    tanggal_wib: getTanggalWIB(waktuFl),
+                    waktu_undian_wib: jamWIB(waktuFl),
+                    tanggal_undian_us: iso(hasilFl.tgl),
+                    zona_undian: tz,
+                    sumber: 'floridalottery.com',
+                    angka_keluar: hasilFl.angka.join('')
+                };
+            })
+        ];
+
+        if (cepatBot) {
+            tugasFL.push(
+                ambilDanParseSumber(cepatBot, { izinkanApiKey: true }).then(resBot => {
+                    const nowWib = new Date();
+                    return {
+                        status: 'sukses',
+                        pasaran: game === 'pick-4-midday' ? 'MIDDAY PICK 4' : 'PICK 4',
+                        tanggal_wib: getTanggalWIB(nowWib),
+                        waktu_undian_wib: slot ? `${slot} WIB` : null,
+                        tanggal_undian_us: iso(partsInTZ(nowWib, tz)),
+                        zona_undian: tz,
+                        sumber: resBot.sumber,
+                        angka_keluar: resBot.p1
+                    };
+                })
+            );
+        }
+
+        try {
+            const payloadFl = await Promise.any(tugasFL);
+            setCache(cacheKey, payloadFl);
+            return { code: 200, data: payloadFl, targetUrl };
+        } catch {
+            const bodyFl = { status: 'belum_update', pesan: 'Hasil Florida belum update hari ini.' };
+            setBelumUpdateCache(cacheKey, { httpCode: 200, body: bodyFl });
+            return { code: 200, data: bodyFl, targetUrl: FL_API };
+        }
+    }
+
+    // 3. Sumber Tercepat dari Config Bot (togel-online.cc / dclottery.com)
+    if (cepatBot) {
+        try {
+            const resBot = await ambilDanParseSumber(cepatBot, { izinkanApiKey: true });
+            const nowWib = new Date();
+            const payloadBot = {
+                status: 'sukses',
+                pasaran: `${state} ${game}`.toUpperCase(),
+                tanggal_wib: getTanggalWIB(nowWib),
+                waktu_undian_wib: slot ? `${slot} WIB` : null,
+                tanggal_undian_us: iso(partsInTZ(nowWib, tz)),
+                zona_undian: tz,
+                sumber: resBot.sumber,
+                angka_keluar: resBot.p1
+            };
+            setCache(cacheKey, payloadBot);
+            return { code: 200, data: payloadBot, targetUrl: cepatBot.url };
+        } catch (errBot) {
+            const bodyBot = { status: 'belum_update', pesan: `Belum update (${errBot.message})` };
+            setBelumUpdateCache(cacheKey, { httpCode: 200, body: bodyBot });
+            return { code: 200, data: bodyBot, targetUrl: cepatBot.url };
+        }
+    }
+
+    // 4. LotteryUSA (hanya untuk pasaran yang tidak punya sumber cepat lain: TX, VA, NJ, AZ, IA, GA, MO, IN)
+    const html = await fetchWithAntiBlock(targetUrl, { timeoutMs: FETCH_TIMEOUT_MS });
+    const $ = cheerio.load(html);
+
+    let namaPasaran = $('h1').first().text()
+        .replace(/winning numbers/i, '')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .toUpperCase() || `${state} ${game}`.toUpperCase();
+
+    const blok = $('.c-game-components').first().length
+        ? $('.c-game-components').first()
+        : $('main').first();
+
+    const tzNow = partsInTZ(new Date(), tz);
+    const bolaPertama = blok
+        .find('[class*="ball"]')
+        .filter((i, el) => !isFireball($, el))
+        .filter((i, el) => /^\d$/.test($(el).text().trim()))
+        .first();
+
+    if (!bolaPertama.length) {
+        const body = {
+            status: 'belum_update',
+            pesan: 'Angka hasil tidak ditemukan pada HTML.',
+            debugExtra: { url: targetUrl, judul: $('title').text().trim(), selector: '.c-game-components [class*="ball"]' }
+        };
+        setBelumUpdateCache(cacheKey, { httpCode: 422, body });
+        return { code: 422, data: body, targetUrl };
+    }
+
+    const wadahAngka = cariWadahAngka($, bolaPertama);
+    let tglRaw = cariTanggalRaw($, wadahAngka) || cariTanggalRaw($, bolaPertama.parent());
+    const tglUndian = parseTanggal(tglRaw, tzNow);
+
+    if (!tglUndian) {
+        const body = {
+            status: 'error',
+            pesan: 'Tanggal undian tidak ditemukan atau formatnya tidak dikenali.',
+            debugExtra: { detail: (tglRaw || '').slice(0, 200), url: targetUrl, judul: $('title').text().trim() }
+        };
+        setBelumUpdateCache(cacheKey, { httpCode: 422, body });
+        return { code: 422, data: body, targetUrl };
+    }
+
+    if (iso(tglUndian) > iso(tzNow)) {
+        const body = {
+            status: 'belum_update',
+            pesan: `Tanggal hasil web ${iso(tglUndian)} lebih baru daripada tanggal lokal ${iso(tzNow)} di ${tz}.`,
+            debugExtra: { url: targetUrl, tanggal_web: iso(tglUndian), tanggal_lokal: iso(tzNow) }
+        };
+        setBelumUpdateCache(cacheKey, { httpCode: 200, body });
+        return { code: 200, data: body, targetUrl };
+    }
+
+    let waktuUndian = slot ? slotWIB(tglUndian, tz, slot) : null;
+    if (!waktuUndian) {
+        const [hh, mm] = (jam || JAM_DEFAULT).split(':').map(Number);
+        waktuUndian = localToDate(tglUndian.y, tglUndian.m, tglUndian.d, hh, mm, tz);
+    }
+
+    const wibUndian = iso(partsInTZ(waktuUndian, 'Asia/Jakarta'));
+    if (wibUndian !== wibHariIniStr) {
+        const body = {
+            status: 'belum_update',
+            pesan: `Tanggal hasil WIB (${wibUndian}) berbeda dari tanggal WIB hari ini (${wibHariIniStr}).`,
+            debugExtra: {
+                url: targetUrl,
+                tanggal_undian_us: iso(tglUndian),
+                tanggal_undian_wib: wibUndian,
+                tanggal_hari_ini_wib: wibHariIniStr,
+                slot_wib: slot || null,
+                jadwal_lokal: jam || JAM_DEFAULT
+            }
+        };
+        setBelumUpdateCache(cacheKey, { httpCode: 200, body });
+        return { code: 200, data: body, targetUrl };
+    }
+
+    let angka = ambilAngka($, wadahAngka);
+    if (angka.length !== 4) {
+        let wadah = wadahAngka.parent();
+        for (let i = 0; i < 5 && wadah.length; i++) {
+            const kandidat = ambilAngka($, wadah);
+            if (kandidat.length >= 4) {
+                angka = kandidat.slice(0, 4);
+                break;
+            }
+            wadah = wadah.parent();
+        }
+    }
+    angka = angka.slice(0, 4);
+
+    if (angka.length !== 4) {
+        const body = {
+            status: 'belum_update',
+            pesan: `Angka belum lengkap (${angka.length}/4).`,
+            debugExtra: { url: targetUrl, tanggal_dibaca: tglRaw, angka_ditemukan: angka }
+        };
+        setBelumUpdateCache(cacheKey, { httpCode: 422, body });
+        return { code: 422, data: body, targetUrl };
+    }
+
+    const payload = {
+        status: 'sukses',
+        pasaran: namaPasaran,
+        tanggal_wib: getTanggalWIB(waktuUndian),
+        waktu_undian_wib: (slot || jam) ? jamWIB(waktuUndian) : null,
+        tanggal_undian_us: iso(tglUndian),
+        zona_undian: tz,
+        angka_keluar: angka.join('')
+    };
+
+    setCache(cacheKey, payload);
+    return { code: 200, data: payload, targetUrl };
+}
+
 app.get('/api/result/:state/:game', async (req, res) => {
     const { state, game } = req.params;
     const debug = req.query.debug === '1';
@@ -1537,289 +2467,19 @@ app.get('/api/result/:state/:game', async (req, res) => {
         });
     }
 
-    const targetGame = GAME_ALIAS[`${state}/${game}`] || game;
-    const targetState = STATE_SLUG[state] || state;
-
-    const targetUrl =
-        `https://www.lotteryusa.com/${targetState}/${targetGame}/`;
-
-    const cacheKey =
-        `${state}/${game}/${iso(partsInTZ(new Date(), 'Asia/Jakarta'))}`;
-
-    const hit = getCache(cacheKey);
-
-    if (hit) {
-        res.setHeader('Cache-Control', 's-maxage=300, stale-while-revalidate');
-        return res.json(bentukRespons(hit, debug));
-    }
-
-    const kunciLotre = `${state}/${game}`;
-
-    if (NY_TIPE_INTERNAL[kunciLotre]) {
-        try {
-            const hasilNY = await ambilNewYorkResmi(kunciLotre);
-
-            if (hasilNY) {
-                const slotNY = SLOT_WIB[kunciLotre];
-                const jamNY = JADWAL[kunciLotre];
-
-                let waktuNY = slotNY ? slotWIB(hasilNY.tgl, tz, slotNY) : null;
-
-                if (!waktuNY) {
-                    const [hhNY, mmNY] = (jamNY || JAM_DEFAULT).split(':').map(Number);
-
-                    waktuNY = localToDate(
-                        hasilNY.tgl.y,
-                        hasilNY.tgl.m,
-                        hasilNY.tgl.d,
-                        hhNY,
-                        mmNY,
-                        tz
-                    );
-                }
-
-                const wibUndianNY = iso(partsInTZ(waktuNY, 'Asia/Jakarta'));
-                const wibHariIni = iso(partsInTZ(new Date(), 'Asia/Jakarta'));
-
-                if (wibUndianNY === wibHariIni) {
-                    const payloadNY = {
-                        status: 'sukses',
-                        pasaran: game === 'midday-win-4' ? 'MIDDAY WIN 4' : 'WIN 4',
-                        tanggal_wib: getTanggalWIB(waktuNY),
-                        waktu_undian_wib: jamWIB(waktuNY),
-                        tanggal_undian_us: iso(hasilNY.tgl),
-                        zona_undian: tz,
-                        sumber: 'nylottery.ny.gov (API)',
-                        angka_keluar: hasilNY.angka.join('')
-                    };
-
-                    setCache(cacheKey, payloadNY);
-                    res.setHeader('Cache-Control', 's-maxage=60, stale-while-revalidate');
-                    return res.json(bentukRespons(payloadNY, debug));
-                }
-            }
-        } catch (errorNY) {
-            // Gagal: lanjut ke LotteryUSA (fallback).
-        }
-    }
-
-    if (FL_TIPE[`${state}/${game}`]) {
-        try {
-            const kunciFl = `${state}/${game}`;
-            const hasilFl = await ambilFloridaResmi(kunciFl);
-
-            if (hasilFl) {
-                const slotFl = SLOT_WIB[kunciFl];
-                const jamFl = JADWAL[kunciFl];
-
-                let waktuFl = slotFl
-                    ? slotWIB(hasilFl.tgl, tz, slotFl)
-                    : null;
-
-                if (!waktuFl) {
-                    const [hhFl, mmFl] = (jamFl || JAM_DEFAULT)
-                        .split(':')
-                        .map(Number);
-
-                    waktuFl = localToDate(
-                        hasilFl.tgl.y,
-                        hasilFl.tgl.m,
-                        hasilFl.tgl.d,
-                        hhFl,
-                        mmFl,
-                        tz
-                    );
-                }
-
-                const wibUndianFl = iso(partsInTZ(waktuFl, 'Asia/Jakarta'));
-                const wibHariIniFl = iso(partsInTZ(new Date(), 'Asia/Jakarta'));
-
-                if (wibUndianFl === wibHariIniFl) {
-                    const payloadFl = {
-                        status: 'sukses',
-                        pasaran: game === 'pick-4-midday'
-                            ? 'MIDDAY PICK 4'
-                            : 'PICK 4',
-                        tanggal_wib: getTanggalWIB(waktuFl),
-                        waktu_undian_wib: jamWIB(waktuFl),
-                        tanggal_undian_us: iso(hasilFl.tgl),
-                        zona_undian: tz,
-                        sumber: 'floridalottery.com',
-                        angka_keluar: hasilFl.angka.join('')
-                    };
-
-                    setCache(cacheKey, payloadFl);
-                    res.setHeader('Cache-Control', 's-maxage=60, stale-while-revalidate');
-                    return res.json(bentukRespons(payloadFl, debug));
-                }
-            }
-        } catch (errorFl) {
-            // Gagal: lanjut ke LotteryUSA di bawah.
-        }
-    }
-
     try {
-        const html = await fetchWithAntiBlock(targetUrl);
-        const $ = cheerio.load(html);
-
-        let namaPasaran = $('h1').first().text()
-            .replace(/winning numbers/i, '')
-            .replace(/\s+/g, ' ')
-            .trim()
-            .toUpperCase();
-
-        if (!namaPasaran) {
-            namaPasaran = `${state} ${game}`.toUpperCase();
+        const hasil = await prosesUSMarket(state, game);
+        if (hasil.data.status === 'sukses') {
+            res.setHeader('Cache-Control', 's-maxage=300, stale-while-revalidate');
+            return res.json(bentukRespons(hasil.data, debug));
         }
 
-        const blok = $('.c-game-components').first().length
-            ? $('.c-game-components').first()
-            : $('main').first();
-
-        const tzNow = partsInTZ(new Date(), tz);
-
-        const bolaPertama = blok
-            .find('[class*="ball"]')
-            .filter((i, el) => !isFireball($, el))
-            .filter((i, el) => /^\d$/.test($(el).text().trim()))
-            .first();
-
-        if (!bolaPertama.length) {
-            return res.status(422).json({
-                status: 'belum_update',
-                pesan: 'Angka hasil tidak ditemukan pada HTML.',
-                ...(debug ? {
-                    url: targetUrl,
-                    judul: $('title').text().trim(),
-                    selector: '.c-game-components [class*="ball"]'
-                } : {})
-            });
-        }
-
-        const wadahAngka = cariWadahAngka($, bolaPertama);
-
-        let tglRaw = cariTanggalRaw($, wadahAngka);
-
-        if (!tglRaw) {
-            tglRaw = cariTanggalRaw($, bolaPertama.parent());
-        }
-
-        const tglUndian = parseTanggal(tglRaw, tzNow);
-
-        if (!tglUndian) {
-            return res.status(422).json({
-                status: 'error',
-                pesan: 'Tanggal undian tidak ditemukan atau formatnya tidak dikenali.',
-                ...(debug ? {
-                    detail: (tglRaw || '').slice(0, 200),
-                    url: targetUrl,
-                    judul: $('title').text().trim()
-                } : {})
-            });
-        }
-
-        if (iso(tglUndian) > iso(tzNow)) {
-            return res.json({
-                status: 'belum_update',
-                pesan:
-                    `Tanggal hasil web ${iso(tglUndian)} lebih baru daripada tanggal lokal ${iso(tzNow)} di ${tz}.`,
-                ...(debug ? {
-                    url: targetUrl,
-                    tanggal_web: iso(tglUndian),
-                    tanggal_lokal: iso(tzNow)
-                } : {})
-            });
-        }
-
-        const kunci = `${state}/${game}`;
-        const slot = SLOT_WIB[kunci];
-        const jam = JADWAL[kunci];
-
-        let waktuUndian = slot
-            ? slotWIB(tglUndian, tz, slot)
-            : null;
-
-        if (!waktuUndian) {
-            const [hh, mm] = (jam || JAM_DEFAULT).split(':').map(Number);
-
-            waktuUndian = localToDate(
-                tglUndian.y,
-                tglUndian.m,
-                tglUndian.d,
-                hh,
-                mm,
-                tz
-            );
-        }
-
-        const wibUndian = iso(partsInTZ(waktuUndian, 'Asia/Jakarta'));
-        const wibHariIni = iso(partsInTZ(new Date(), 'Asia/Jakarta'));
-
-        if (wibUndian !== wibHariIni) {
-            return res.json({
-                status: 'belum_update',
-                pesan:
-                    `Tanggal hasil WIB (${wibUndian}) berbeda dari tanggal WIB hari ini (${wibHariIni}).`,
-                ...(debug ? {
-                    url: targetUrl,
-                    tanggal_undian_us: iso(tglUndian),
-                    tanggal_undian_wib: wibUndian,
-                    tanggal_hari_ini_wib: wibHariIni,
-                    slot_wib: slot || null,
-                    jadwal_lokal: jam || JAM_DEFAULT
-                } : {})
-            });
-        }
-
-        let angka = ambilAngka($, wadahAngka);
-
-        if (angka.length !== 4) {
-            let wadah = wadahAngka.parent();
-
-            for (let i = 0; i < 5 && wadah.length; i++) {
-                const kandidat = ambilAngka($, wadah);
-
-                if (kandidat.length >= 4) {
-                    angka = kandidat.slice(0, 4);
-                    break;
-                }
-
-                wadah = wadah.parent();
-            }
-        }
-
-        angka = angka.slice(0, 4);
-
-        if (angka.length !== 4) {
-            return res.status(422).json({
-                status: 'belum_update',
-                pesan: `Angka belum lengkap (${angka.length}/4).`,
-                ...(debug ? {
-                    url: targetUrl,
-                    tanggal_dibaca: tglRaw,
-                    angka_ditemukan: angka
-                } : {})
-            });
-        }
-
-        const tglWib = getTanggalWIB(waktuUndian);
-        const waktuWib = (slot || jam) ? jamWIB(waktuUndian) : null;
-
-        const payload = {
-            status: 'sukses',
-            pasaran: namaPasaran,
-            tanggal_wib: tglWib,
-            waktu_undian_wib: waktuWib,
-            tanggal_undian_us: iso(tglUndian),
-            zona_undian: tz,
-            angka_keluar: angka.join('')
-        };
-
-        setCache(cacheKey, payload);
-
-        res.setHeader('Cache-Control', 's-maxage=300, stale-while-revalidate');
-        return res.json(bentukRespons(payload, debug));
+        const { debugExtra, ...bersih } = hasil.data;
+        return res.status(hasil.code).json(debug ? { ...bersih, ...(debugExtra || {}) } : bersih);
     } catch (error) {
+        const targetGame = GAME_ALIAS[`${state}/${game}`] || game;
+        const targetState = STATE_SLUG[state] || state;
+        const targetUrl = `https://www.lotteryusa.com/${targetState}/${targetGame}/`;
         return res.status(502).json({
             status: 'error',
             pesan: 'Gagal mengambil data dari target.',
@@ -1831,6 +2491,7 @@ app.get('/api/result/:state/:game', async (req, res) => {
         });
     }
 });
+
 // ================= ENDPOINT NEW ZEALAND BULLSEYE =================
 
 app.get('/api/result/bullseye', async (req, res) => {
@@ -1861,118 +2522,99 @@ app.get('/api/result/bullseye', async (req, res) => {
             pesan: 'Gagal mengambil hasil New Zealand Bullseye.',
             ...(debug ? {
                 detail: error.message,
-                url: BULLSEYE_API,
                 waktu: dapatkanWaktuWIB()
             } : {})
         });
     }
 });
 
-// ================= TAIWAN =================
-const TAIWAN_API = 'https://livedrawhijau.org/taiwan/update_taiwan';
-const TAIWAN_FIELDS = ['prize1', 'grand', 'regular', 'second', 'third', 'fourth'];
+// ================= TAIWAN (HANYA SUMBER TERCEPAT DI LOG) =================
+const TAIWAN_SUMBER_TERCEPAT = [
+    { url: 'https://www.pewaristotoprediksi.com/api/market-latest?market=taiwan', isJson: true },
+    { url: 'https://159.89.203.33/live-draw/taiwan/proxy_taiwan.php', isJson: true }
+];
+
+async function prosesTaiwan() {
+    const isoHariIni = iso(partsInTZ(new Date(), 'Asia/Jakarta'));
+    const cacheKey = `taiwan_prize1_${isoHariIni}`;
+
+    const hit = getCache(cacheKey);
+    if (hit) return hit;
+
+    const hitBelum = getBelumUpdateCache(cacheKey);
+    if (hitBelum) return hitBelum;
+
+    const sekarangWIB = new Intl.DateTimeFormat('en-GB', {
+        timeZone: 'Asia/Jakarta',
+        hour: '2-digit',
+        minute: '2-digit',
+        hourCycle: 'h23'
+    }).formatToParts(new Date());
+
+    const menitWIB =
+        Number(sekarangWIB.find(p => p.type === 'hour').value) * 60 +
+        Number(sekarangWIB.find(p => p.type === 'minute').value);
+
+    if (menitWIB < 20 * 60 + 30) {
+        const belum = {
+            status: 'belum_update',
+            pesan: 'Undian Taiwan belum dimulai (sekitar 20:35 WIB).'
+        };
+        setBelumUpdateCache(cacheKey, belum);
+        return belum;
+    }
+
+    const ctrl = new AbortController();
+    const tugas = TAIWAN_SUMBER_TERCEPAT.map(src =>
+        ambilDanParseSumber(src, { signal: ctrl.signal, izinkanApiKey: true }).then(res => ({
+            status: 'sukses',
+            pasaran: 'TAIWAN',
+            tanggal_wib: getTanggalWIB(),
+            angka_keluar: res.p1,
+            sumber: res.sumber
+        }))
+    );
+
+    try {
+        const menang = await Promise.any(tugas);
+        ctrl.abort();
+        setCache(cacheKey, menang);
+        return menang;
+    } catch (aggErr) {
+        ctrl.abort();
+        const pesanPertama = aggErr?.errors?.[0]?.message || 'Belum update.';
+        const belum = {
+            status: 'belum_update',
+            pesan: pesanPertama
+        };
+        setBelumUpdateCache(cacheKey, belum);
+        return belum;
+    }
+}
 
 app.get('/api/result/taiwan', async (req, res) => {
     const debug = req.query.debug === '1';
-    const field = TAIWAN_FIELDS.includes(req.query.field)
-        ? req.query.field
-        : 'prize1';
 
     try {
-        const respons = await axios.get(TAIWAN_API, {
-            headers: {
-                ...getRandomHeaders(),
-                'Accept': 'application/json, text/javascript, */*; q=0.01',
-                'X-Requested-With': 'XMLHttpRequest',
-                'Referer': 'https://livedrawhijau.org/taiwan/'
-            },
-            params: { _: Date.now() },
-            timeout: 8000
-        });
+        const payload = await prosesTaiwan();
 
-        const d = Array.isArray(respons.data) ? respons.data[0] : respons.data;
-
-        if (!d || typeof d !== 'object' || !d[field]) {
-            return res.status(422).json({
-                status: 'error',
-                pasaran: 'TAIWAN',
-                pesan: 'Format respons sumber Taiwan tidak dikenali.'
-            });
+        if (payload.status === 'sukses') {
+            res.setHeader('Cache-Control', 's-maxage=60, stale-while-revalidate');
+            if (!debug) {
+                const { sumber, ...bersih } = payload;
+                return res.json(bersih);
+            }
+            return res.json(payload);
         }
 
-        const m = String(d.tanggal || '').match(/^(\d{4})-(\d{2})-(\d{2})$/);
-
-        if (!m || !tanggalValid(d.tanggal)) {
-            return res.status(422).json({
-                status: 'error',
-                pasaran: 'TAIWAN',
-                pesan: 'Tanggal pada sumber Taiwan tidak valid.'
-            });
-        }
-
-        // Undian Taiwan sekitar 20:35 WIB. Tolak sebelum 20:30 WIB.
-        const sekarangWIB = new Intl.DateTimeFormat('en-GB', {
-            timeZone: 'Asia/Jakarta',
-            hour: '2-digit',
-            minute: '2-digit',
-            hourCycle: 'h23'
-        }).formatToParts(new Date());
-
-        const menitWIB =
-            Number(sekarangWIB.find(p => p.type === 'hour').value) * 60 +
-            Number(sekarangWIB.find(p => p.type === 'minute').value);
-
-        if (menitWIB < 20 * 60 + 30) {
-            return res.json({
-                status: 'belum_update',
-                pesan: 'Undian Taiwan belum dimulai (sekitar 20:35 WIB).'
-            });
-        }
-
-        const isoHariIni = iso(partsInTZ(new Date(), 'Asia/Jakarta'));
-
-        if (d.tanggal !== isoHariIni) {
-            return res.json({
-                status: 'belum_update',
-                pesan: `Hasil Taiwan belum update (sumber: ${d.tanggal}, hari ini WIB: ${isoHariIni}).`,
-                ...(debug ? { draw_id: d.id } : {})
-            });
-        }
-
-        const angka = String(d[field]).replace(/\D/g, '');
-
-        if (angka.length < 4) {
-            return res.status(422).json({
-                status: 'belum_update',
-                pasaran: 'TAIWAN',
-                pesan: 'Angka Taiwan belum lengkap.'
-            });
-        }
-
-        const tglObj = new Date(Date.UTC(
-            Number(m[1]), Number(m[2]) - 1, Number(m[3]), 5, 0, 0
-        ));
-
-        const payload = {
-            status: 'sukses',
-            pasaran: 'TAIWAN',
-            tanggal_wib: getTanggalWIB(tglObj),
-            angka_keluar: angka.slice(-4),
-            ...(debug ? { draw_id: d.id, field, angka_penuh: angka } : {})
-        };
-
-        res.setHeader('Cache-Control', 's-maxage=60, stale-while-revalidate');
-        return res.json(bentukRespons(payload, debug));
+        return res.json(payload);
     } catch (error) {
         return res.status(502).json({
             status: 'error',
             pasaran: 'TAIWAN',
             pesan: 'Gagal mengambil hasil Taiwan.',
             ...(debug ? {
-                detail: error.response
-                    ? `Sumber membalas HTTP ${error.response.status}`
-                    : error.message,
-                url: TAIWAN_API,
+                detail: error.message,
                 waktu: dapatkanWaktuWIB()
             } : {})
         });
@@ -1991,7 +2633,7 @@ app.get('/api/markets', async (req, res) => {
     }
 
     try {
-        const html = await fetchWithAntiBlock('https://www.lotteryusa.com/');
+        const html = await fetchWithAntiBlock('https://www.lotteryusa.com/', { timeoutMs: FETCH_TIMEOUT_MS });
         const $ = cheerio.load(html);
         const markets = [];
 
@@ -2086,107 +2728,14 @@ app.get('/api/markets', async (req, res) => {
 });
 
 // ==========================================================
-// ================= PASARAN TAMBAHAN (DARI BOT) =================
-// Sumber & selector disalin dari config bot, diurutkan dari
-// yang paling sering menang di scraper_speed.log. Semua sumber
-// dibalap paralel; yang valid pertama menang.
-//   gambar      : angka berupa gambar bola (_5.jpg)
-//   gabung      : gabungkan semua elemen yang cocok
-//   fallbackBot : tanpa selector -> .resultTable2 / .outerbox (sama seperti bot)
-//   hijau       : JSON livedrawhijau.org [{prize1, prize2, prize3, tanggal}]
+// ================= PASARAN TAMBAHAN (HANYA TERCEPAT DI LOG & CONFIG.JS) =================
 // ==========================================================
-const https = require('https');
-
-const httpsAgentLonggar = new https.Agent({
-    rejectUnauthorized: false,
-    keepAlive: true,
-    minVersion: 'TLSv1.2',
-    ciphers: [
-        'TLS_AES_128_GCM_SHA256',
-        'TLS_AES_256_GCM_SHA384',
-        'TLS_CHACHA20_POLY1305_SHA256',
-        'ECDHE-ECDSA-AES128-GCM-SHA256',
-        'ECDHE-RSA-AES128-GCM-SHA256',
-        'ECDHE-ECDSA-AES256-GCM-SHA384',
-        'ECDHE-RSA-AES256-GCM-SHA384',
-        'ECDHE-ECDSA-CHACHA20-POLY1305',
-        'ECDHE-RSA-CHACHA20-POLY1305',
-        'ECDHE-RSA-AES128-SHA',
-        'ECDHE-RSA-AES256-SHA',
-        'AES128-GCM-SHA256',
-        'AES256-GCM-SHA384',
-        'AES128-SHA',
-        'AES256-SHA'
-    ].join(':')
-});
-
-const BULAN_ID_X = [
-    'Januari', 'Februari', 'Maret', 'April', 'Mei', 'Juni',
-    'Juli', 'Agustus', 'September', 'Oktober', 'November', 'Desember'
-];
-const BULAN_EN_X = [
-    'January', 'February', 'March', 'April', 'May', 'June',
-    'July', 'August', 'September', 'October', 'November', 'December'
-];
-
-// Pola tanggal sama dengan isDateValid() di scraper.js (tanggal WIB hari ini).
-function adaTanggalHariIni(teks) {
-    const { y, m, d } = partsInTZ(new Date(), 'Asia/Jakarta');
-    const dd = String(d).padStart(2, '0');
-    const mm = String(m).padStart(2, '0');
-    const yy = String(y).slice(-2);
-    const id = BULAN_ID_X[m - 1];
-    const en = BULAN_EN_X[m - 1];
-    const idShort = id.slice(0, 3);
-    const enShort = en.slice(0, 3);
-
-    const sep = '[-/.,\\s]+';
-    const b = '(?<!\\d)';
-    const e = '(?!\\d)';
-
-    // 24 pola persis sama dengan isDateValid() di scraper.js
-    const pola = [
-        `${b}0?${d}${sep}0?${m}${sep}${y}${e}`,
-        `${b}${y}${sep}0?${m}${sep}0?${d}${e}`,
-        `${b}0?${m}${sep}0?${d}${sep}${y}${e}`,
-        `${b}0?${d}${sep}0?${m}${sep}${yy}${e}`,
-        `${b}0?${m}${sep}0?${d}${sep}${yy}${e}`,
-        `${b}${yy}${sep}0?${m}${sep}0?${d}${e}`,
-        `${b}0?${d}${sep}${id}${sep}${y}${e}`,
-        `${b}0?${d}${sep}${idShort}${sep}${y}${e}`,
-        `${b}${id}${sep}0?${d}${sep}${y}${e}`,
-        `${b}${idShort}${sep}0?${d}${sep}${y}${e}`,
-        `${b}0?${d}${sep}${en}${sep}${y}${e}`,
-        `${b}0?${d}${sep}${enShort}${sep}${y}${e}`,
-        `${b}${en}${sep}0?${d}${sep}${y}${e}`,
-        `${b}${enShort}${sep}0?${d}${sep}${y}${e}`,
-        `${b}${dd}${mm}${y}${e}`,
-        `${b}${y}${mm}${dd}${e}`,
-        `${b}${dd}${enShort}${y}${e}`,
-        `${b}${dd}${idShort}${y}${e}`,
-        `${b}0?${d}${sep}${id}${e}`,
-        `${b}0?${d}${sep}${idShort}${e}`,
-        `${b}0?${d}${sep}${en}${e}`,
-        `${b}0?${d}${sep}${enShort}${e}`,
-        `${b}${en}${sep}0?${d}${e}`,
-        `${b}${enShort}${sep}0?${d}${e}`
-    ];
-
-    const s = String(teks || '');
-    return pola.some(p => new RegExp(p, 'i').test(s));
-}
-
-const LIVEDRAW_ONLINE_3 = {
-    p1: '.table.text-center tr:nth-child(1) td:nth-child(2) span',
-    p2: '.table.text-center tr:nth-child(2) td:nth-child(2) span',
-    p3: '.table.text-center tr:nth-child(3) td:nth-child(2) span'
-};
 
 const PASARAN_TAMBAHAN = {
     'hk': {
         nama: 'HONGKONG',
         sumber: [
-            { url: 'https://live.angka.live/livedrawhk/', fallbackBot: true },
+            { url: 'https://live.angka.live/livedrawhk/' },
             {
                 url: 'https://hongkonglivedraw.biz/live-draw-hk/hk.php',
                 prizeSelectors: {
@@ -2194,19 +2743,6 @@ const PASARAN_TAMBAHAN = {
                     p2: 'tr:nth-of-type(4) td.box-value',
                     p3: 'tr:nth-of-type(5) td.box-value'
                 }
-            },
-            {
-                url: 'https://rankcrack.com/hk.php',
-                prizeSelectors: {
-                    p1: 'tr:nth-of-type(4) td.box-value',
-                    p2: 'tr:nth-of-type(5) td.box-value',
-                    p3: 'tr:nth-of-type(6) td.box-value'
-                }
-            },
-            { url: 'https://livedraw.online/hongkong/', prizeSelectors: LIVEDRAW_ONLINE_3 },
-            {
-                url: 'https://live-hongkong.blogspot.com/',
-                prizeSelectors: { p1: '#mydiv3', p2: '#mydiv4', p3: '#mydiv5' }
             }
         ]
     },
@@ -2214,24 +2750,7 @@ const PASARAN_TAMBAHAN = {
     'hk-lotto': {
         nama: 'HONGKONG LOTTO',
         sumber: [
-            { url: 'https://hongkonglotto.com/positionPlace', fallbackBot: true },
-            {
-                url: 'https://rankcrack.com/hklotto.php',
-                prizeSelectors: {
-                    p1: 'tr:nth-of-type(4) td.box-value a',
-                    p2: 'tr:nth-of-type(6) td.box-value span',
-                    p3: 'tr:nth-of-type(7) td.box-value span'
-                }
-            },
-            {
-                url: 'https://68.183.227.182/live-draw-togel/hk-live.php',
-                prizeSelectors: {
-                    p1: '.entry-ld-body tr:nth-of-type(1) td:nth-child(2)',
-                    p2: '.entry-ld-body tr:nth-of-type(2) td:nth-child(2)',
-                    p3: '.entry-ld-body tr:nth-of-type(3) td:nth-child(2)'
-                }
-            },
-            { url: 'https://livedraw.online/hongkong-lotto/', prizeSelectors: LIVEDRAW_ONLINE_3 }
+            { url: 'https://hongkonglotto.com/positionPlace', isJson: true }
         ]
     },
 
@@ -2239,22 +2758,6 @@ const PASARAN_TAMBAHAN = {
         nama: 'SINGAPORE 4D',
         sumber: [
             { url: 'https://livedrawhijau.org/singaporepools/update_sgp_pools', hijau: true },
-            {
-                url: 'https://www.singaporepools.com.sg/DataFileArchive/Lottery/Output/fourd_result_top_draws_en.html',
-                prizeSelectors: {
-                    p1: 'td.tdFirstPrize',
-                    p2: 'td.tdSecondPrize',
-                    p3: 'td.tdThirdPrize'
-                }
-            },
-            {
-                url: 'https://rankcrack.com/sgp.php',
-                prizeSelectors: {
-                    p1: 'tr:nth-of-type(4) td.box-value',
-                    p2: 'tr:nth-of-type(5) td.box-value',
-                    p3: 'tr:nth-of-type(6) td.box-value'
-                }
-            },
             {
                 url: 'https://livedraw.online/singapore/',
                 prizeSelectors: {
@@ -2266,26 +2769,22 @@ const PASARAN_TAMBAHAN = {
         ]
     },
 
+    'sgp-toto': {
+        nama: 'SINGAPORE TOTO',
+        sumber: [
+            {
+                url: 'https://livedraw.online/singapore-toto/',
+                prizeSelectors: {
+                    p1: 'h3 span.text-gold'
+                }
+            },
+            { url: 'https://livedrawhijau.org/singaporetoto/update_sgptoto', hijau: true }
+        ]
+    },
+
     'sydney': {
         nama: 'SYDNEY POOLS',
         sumber: [
-            {
-                url: 'https://www.sydneypoolstoday.com/',
-                gambar: true,
-                prizeSelectors: {
-                    p1: 'table.sample:eq(0) tr:nth-child(1) td:nth-child(2)',
-                    p2: 'table.sample:eq(0) tr:nth-child(3) td:nth-child(2)',
-                    p3: 'table.sample:eq(0) tr:nth-child(5) td:nth-child(2)'
-                }
-            },
-            {
-                url: 'https://rankcrack.com/sdy.php',
-                prizeSelectors: {
-                    p1: 'tr:nth-of-type(4) td.box-value a',
-                    p2: 'tr:nth-of-type(5) td.box-value span',
-                    p3: 'tr:nth-of-type(6) td.box-value span'
-                }
-            },
             {
                 url: 'https://livedrawnorthcarolinaday.wiki/livedraw/sydney.php',
                 prizeSelectors: {
@@ -2294,22 +2793,22 @@ const PASARAN_TAMBAHAN = {
                     p3: 'tr:nth-child(4) td.warnaisi'
                 }
             },
-            { url: 'https://livedraw.online/sydney/', prizeSelectors: LIVEDRAW_ONLINE_3 }
+            {
+                url: 'https://www.sydneypoolstoday.com/',
+                gambar: true,
+                prizeSelectors: {
+                    p1: 'table.sample:eq(0) tr:nth-child(1) td:nth-child(2)',
+                    p2: 'table.sample:eq(0) tr:nth-child(3) td:nth-child(2)',
+                    p3: 'table.sample:eq(0) tr:nth-child(5) td:nth-child(2)'
+                }
+            }
         ]
     },
 
     'sydney-lotto': {
         nama: 'SYDNEY LOTTO',
         sumber: [
-            { url: 'https://sydneylotto.com/positionPlace', fallbackBot: true },
-            {
-                url: 'https://rankcrack.com/sdylotto.php',
-                prizeSelectors: {
-                    p1: 'tr:nth-of-type(4) td.box-value a',
-                    p2: 'tr:nth-of-type(6) td.box-value span',
-                    p3: 'tr:nth-of-type(7) td.box-value span'
-                }
-            }
+            { url: 'https://sydneylotto.com/positionPlace', isJson: true }
         ]
     },
 
@@ -2323,14 +2822,6 @@ const PASARAN_TAMBAHAN = {
                     p2: '#table_home_1 tr:nth-child(2) td.td2_home1',
                     p3: '#table_home_1 tr:nth-child(3) td.td2_home1'
                 }
-            },
-            {
-                url: 'https://livedrawchina.store/',
-                prizeSelectors: {
-                    p1: '.ld-prize:eq(0) .ld-balls',
-                    p2: '.ld-prize:eq(1) .ld-balls',
-                    p3: '.ld-prize:eq(2) .ld-balls'
-                }
             }
         ]
     },
@@ -2338,16 +2829,14 @@ const PASARAN_TAMBAHAN = {
     'magnum4d': {
         nama: 'MAGNUM 4D',
         sumber: [
-            { url: 'https://togel-online.cc/livedraw/magnum4d', selector: 'p.text-gold' },
-            { url: 'https://magnum4d.my/en/results', selector: '#fprize' }
+            { url: 'https://togel-online.cc/livedraw/magnum4d', selector: 'p.text-gold' }
         ]
     },
 
     'pcso': {
         nama: 'PCSO',
         sumber: [
-            { url: 'https://togel-online.cc/livedraw/pcso', selector: 'p.text-gold' },
-            { url: 'https://rankcrack.com/pcso.php', selector: '.td.box-value a' }
+            { url: 'https://togel-online.cc/livedraw/pcso', selector: 'p.text-gold' }
         ]
     },
 
@@ -2383,261 +2872,215 @@ function hostDari(url) {
     try { return new URL(url).hostname; } catch (e) { return url; }
 }
 
-function ekstrakTambahan($, selector, src) {
-    if (src.gambar) {
-        let angka = '';
+async function prosesPasaranTambahan(slug, cfg) {
+    const hariIni = iso(partsInTZ(new Date(), 'Asia/Jakarta'));
+    const kunciCache = `tambahan_${slug}_${hariIni}`;
 
-        $(selector).first().find('img').each((_, el) => {
-            const m = ($(el).attr('src') || '').match(/_(\d)\.jpg/i);
-            if (m) angka += m[1];
-        });
+    const hit = getCache(kunciCache);
+    if (hit) return hit;
 
-        return angka;
-    }
+    const hitBelum = getBelumUpdateCache(kunciCache);
+    if (hitBelum) return hitBelum;
 
-    if (src.gabung) {
-        return $(selector)
-            .map((_, el) => $(el).text().trim())
-            .get()
-            .join('');
-    }
+    const ctrl = new AbortController();
+    const galat = [];
 
-    return $(selector).first().text().trim();
-}
-
-async function ambilSumberTambahan(src, signal, izinkanApiKey = true) {
-    const isApiJson = Boolean(src.hijau);
-
-    // Hindari penambahan query ?_=Date.now() pada halaman HTML agar tidak ditolak WAF (403).
-    const url = isApiJson
-        ? src.url + (src.url.includes('?') ? '&' : '?') + '_=' + Date.now()
-        : src.url;
-
-    const headers = isApiJson
-        ? {
-            'User-Agent':
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-            'Accept': 'application/json, text/javascript, */*; q=0.01',
-            'Accept-Language': 'id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7',
-            'X-Requested-With': 'XMLHttpRequest',
-            'Referer':
-                'https://livedrawhijau.org/' +
-                new URL(src.url).pathname.split('/')[1] +
-                '/',
-            'Sec-Ch-Ua':
-                '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
-            'Sec-Ch-Ua-Mobile': '?0',
-            'Sec-Ch-Ua-Platform': '"Windows"',
-            'Sec-Fetch-Dest': 'empty',
-            'Sec-Fetch-Mode': 'cors',
-            'Sec-Fetch-Site': 'same-origin'
-        }
-        : {
-            'User-Agent':
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-            'Accept':
-                'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-            'Accept-Language': 'id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'Cache-Control': 'max-age=0',
-            'Upgrade-Insecure-Requests': '1',
-            'Sec-Ch-Ua':
-                '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
-            'Sec-Ch-Ua-Mobile': '?0',
-            'Sec-Ch-Ua-Platform': '"Windows"',
-            'Sec-Fetch-Dest': 'document',
-            'Sec-Fetch-Mode': 'navigate',
-            'Sec-Fetch-Site': 'none',
-            'Sec-Fetch-User': '?1'
-        };
-
-    const data = await fetchDenganFallback(url, {
-        headers,
-        httpsAgent: httpsAgentLonggar,
-        signal,
-        isJson: isApiJson,
-        izinkanApiKey
-    });
-
-    if (typeof data !== 'string' || data.length < 2) {
-        throw new Error('respons kosong');
-    }
-
-    // ----- JSON livedrawhijau.org -----
-    if (src.hijau) {
-        let json;
+    try {
+        let menang;
 
         try {
-            json = JSON.parse(data);
-        } catch (e) {
-            throw new Error('JSON tidak valid');
+            menang = await Promise.any(
+                cfg.sumber.map(src =>
+                    ambilDanParseSumber(src, {
+                        signal: ctrl.signal,
+                        izinkanApiKey: false,
+                        digits: cfg.digits || 4,
+                        position: cfg.position || 'LAST'
+                    }).catch(err => {
+                        galat.push(`${hostDari(src.url)}: ${err.message}`);
+                        throw err;
+                    })
+                )
+            );
+
+            ctrl.abort();
+        } catch (firstErr) {
+            ctrl.abort();
+
+            const adaBlokir = galat.some(g =>
+                /403|407|429|503|cloudflare|ditolak/i.test(g)
+            );
+
+            if (!adaBlokir) {
+                throw firstErr;
+            }
+
+            const ctrlProxy = new AbortController();
+            try {
+                menang = await Promise.any(
+                    cfg.sumber.map(src =>
+                        ambilDanParseSumber(src, {
+                            signal: ctrlProxy.signal,
+                            izinkanApiKey: true,
+                            digits: cfg.digits || 4,
+                            position: cfg.position || 'LAST'
+                        }).catch(err => {
+                            galat.push(`${hostDari(src.url)} (proxy): ${err.message}`);
+                            throw err;
+                        })
+                    )
+                );
+            } finally {
+                ctrlProxy.abort();
+            }
         }
 
-        const d = Array.isArray(json) ? json[0] : json;
+        const payload = {
+            status: 'sukses',
+            pasaran: cfg.nama,
+            tanggal_wib: getTanggalWIB(),
+            angka_keluar: menang.p1,
+            ...(menang.p2 ? { p1: menang.p1, p2: menang.p2, p3: menang.p3 } : {}),
+            sumber: menang.sumber
+        };
 
-        if (!d || !d.prize1) {
-            throw new Error('format JSON tidak dikenali');
-        }
-
-        if (!adaTanggalHariIni(JSON.stringify(json))) {
-            throw new Error('tanggal belum update');
-        }
-
-        const p1 = String(d.prize1).replace(/\D/g, '');
-
-        if (p1.length < 4) throw new Error('p1 kosong');
-
-        const hasil = { p1: p1.slice(-4) };
-
-        if (d.prize2) {
-            const p2 = String(d.prize2).replace(/\D/g, '');
-            if (p2.length >= 4) hasil.p2 = p2.slice(-4);
-        }
-
-        if (d.prize3) {
-            const p3 = String(d.prize3).replace(/\D/g, '');
-            if (p3.length >= 4) hasil.p3 = p3.slice(-4);
-        }
-
-        return { ...hasil, sumber: hostDari(src.url) };
+        setCache(kunciCache, payload);
+        return payload;
+    } catch (err) {
+        const belum = {
+            status: 'belum_update',
+            pasaran: cfg.nama,
+            pesan: 'Belum update: ' + [...new Set(galat)].join(' | ').slice(0, 300),
+            detail_galat: galat
+        };
+        setBelumUpdateCache(kunciCache, belum);
+        return belum;
     }
-
-    // ----- HTML -----
-    if (data.length < 100) {
-        throw new Error('respons kosong');
-    }
-
-    if (diblokCF(data)) {
-        throw new Error('diblokir Cloudflare');
-    }
-
-    // Sama seperti bot: halaman harus memuat tanggal WIB hari ini.
-    if (!adaTanggalHariIni(data)) {
-        throw new Error('tanggal belum update');
-    }
-
-    const $ = cheerio.load(data);
-
-    if (src.fallbackBot) {
-        const raw =
-            $('.resultTable2').text().trim() ||
-            $('.outerbox').text().trim();
-
-        const angka = String(raw).replace(/\D/g, '');
-
-        if (angka.length < 4) {
-            throw new Error('angka tidak ditemukan');
-        }
-
-        return { p1: angka.slice(-4), sumber: hostDari(src.url) };
-    }
-
-    const daftarHadiah = src.prizeSelectors || { p1: src.selector };
-    const hasil = {};
-
-    for (const [kunci, selector] of Object.entries(daftarHadiah)) {
-        const angka = ekstrakTambahan($, selector, src).replace(/\D/g, '');
-
-        if (angka.length < 4) {
-            throw new Error(`${kunci} kosong atau selector tidak cocok`);
-        }
-
-        hasil[kunci] = angka.slice(-4);
-    }
-
-    return { ...hasil, sumber: hostDari(src.url) };
 }
 
 for (const [slug, cfg] of Object.entries(PASARAN_TAMBAHAN)) {
     app.get(`/api/result/${slug}`, async (req, res) => {
         const debug = req.query.debug === '1';
-        const hariIni = iso(partsInTZ(new Date(), 'Asia/Jakarta'));
-        const kunciCache = `tambahan_${slug}_${hariIni}`;
+        const payload = await prosesPasaranTambahan(slug, cfg);
 
-        const hit = getCache(kunciCache);
-
-        if (hit) {
-            res.setHeader('Cache-Control', 's-maxage=60, stale-while-revalidate');
-            return res.json(bentukResponsTambahan(hit, debug));
-        }
-
-        const ctrl = new AbortController();
-        const galat = [];
-
-        try {
-            let menang;
-
-            try {
-                menang = await Promise.any(
-                    cfg.sumber.map(src =>
-                        ambilSumberTambahan(src, ctrl.signal, false).catch(err => {
-                            galat.push(`${hostDari(src.url)}: ${err.message}`);
-                            throw err;
-                        })
-                    )
-                );
-
-                ctrl.abort();
-            } catch (firstErr) {
-                ctrl.abort();
-
-                const adaBlokir = galat.some(g =>
-                    /403|407|429|503|cloudflare|ditolak/i.test(g)
-                );
-
-                if (!adaBlokir) {
-                    throw firstErr;
-                }
-
-                menang = await ambilSumberTambahan(
-                    cfg.sumber[0],
-                    undefined,
-                    true
-                ).catch(err => {
-                    galat.push(`${hostDari(cfg.sumber[0].url)} (proxy): ${err.message}`);
-                    throw err;
-                });
-            }
-
-            const payload = {
-                status: 'sukses',
-                pasaran: cfg.nama,
-                tanggal_wib: getTanggalWIB(),
-                angka_keluar: menang.p1,
-                ...(menang.p2 ? { p1: menang.p1, p2: menang.p2, p3: menang.p3 } : {}),
-                sumber: menang.sumber
-            };
-
-            setCache(kunciCache, payload);
-
+        if (payload.status === 'sukses') {
             res.setHeader('Cache-Control', 's-maxage=60, stale-while-revalidate');
             return res.json(bentukResponsTambahan(payload, debug));
-        } catch (err) {
-            // Awalan "Belum update" supaya bot tidak menulis ke scraper_error.log.
-            return res.json({
-                status: 'belum_update',
-                pasaran: cfg.nama,
-                pesan: 'Belum update: ' + [...new Set(galat)].join(' | ').slice(0, 300),
-                ...(debug ? { detail: galat } : {})
-            });
         }
+
+        const { detail_galat, ...bersih } = payload;
+        return res.json(debug ? { ...bersih, detail: detail_galat } : bersih);
     });
 }
 
 function bentukResponsTambahan(full, debug) {
     if (debug) return full;
 
-    const { sumber, ...tanpaSumber } = full;
+    const { sumber, detail_galat, ...tanpaSumber } = full;
 
     return tanpaSumber;
+}
+
+// ================= BACKGROUND POLLER OTOMATIS (30 DETIK SEBELUM JAM UNDIAN) =================
+const JADWAL_POLLER_WIB = [
+    { id: 'macau_0000', jam: '00:01', run: () => prosesMacau('00:00') },
+    { id: 'macau_1300', jam: '13:01', run: () => prosesMacau('13:00') },
+    { id: 'macau_1600', jam: '16:01', run: () => prosesMacau('16:00') },
+    { id: 'macau_1900', jam: '19:01', run: () => prosesMacau('19:00') },
+    { id: 'macau_2200', jam: '22:01', run: () => prosesMacau('22:00') },
+    { id: 'macau_2300', jam: '23:01', run: () => prosesMacau('23:00') },
+    { id: 'hk_pools_day', jam: '11:00', run: () => prosesHkPools('day') },
+    { id: 'hk_pools_night', jam: '23:00', run: () => prosesHkPools('night') },
+    { id: 'bullseye', jam: '13:05', run: () => ambilBullseye() },
+    { id: 'taiwan', jam: '20:45', run: () => prosesTaiwan() },
+    { id: 'tambahan_hk', jam: '23:00', run: () => prosesPasaranTambahan('hk', PASARAN_TAMBAHAN['hk']) },
+    { id: 'tambahan_hk-lotto', jam: '23:05', run: () => prosesPasaranTambahan('hk-lotto', PASARAN_TAMBAHAN['hk-lotto']) },
+    { id: 'tambahan_sgp4d', jam: '17:30', run: () => prosesPasaranTambahan('sgp4d', PASARAN_TAMBAHAN['sgp4d']) },
+    { id: 'tambahan_sgp-toto', jam: '17:30', run: () => prosesPasaranTambahan('sgp-toto', PASARAN_TAMBAHAN['sgp-toto']) },
+    { id: 'tambahan_sydney', jam: '13:30', run: () => prosesPasaranTambahan('sydney', PASARAN_TAMBAHAN['sydney']) },
+    { id: 'tambahan_sydney-lotto', jam: '13:45', run: () => prosesPasaranTambahan('sydney-lotto', PASARAN_TAMBAHAN['sydney-lotto']) },
+    { id: 'tambahan_china', jam: '15:30', run: () => prosesPasaranTambahan('china', PASARAN_TAMBAHAN['china']) },
+    { id: 'tambahan_japan', jam: '17:15', run: () => prosesPasaranTambahan('japan', PASARAN_TAMBAHAN['japan']) },
+    { id: 'tambahan_cambodia', jam: '11:50', run: () => prosesPasaranTambahan('cambodia', PASARAN_TAMBAHAN['cambodia']) },
+    { id: 'tambahan_magnum4d', jam: '18:15', run: () => prosesPasaranTambahan('magnum4d', PASARAN_TAMBAHAN['magnum4d']) },
+    { id: 'tambahan_pcso', jam: '19:55', run: () => prosesPasaranTambahan('pcso', PASARAN_TAMBAHAN['pcso']) },
+    { id: 'tambahan_taipei', jam: '21:05', run: () => prosesPasaranTambahan('taipei', PASARAN_TAMBAHAN['taipei']) },
+    ...Object.entries(SLOT_WIB).map(([kunci, jam]) => {
+        const [state, game] = kunci.split('/');
+        return {
+            id: `us_${kunci}`,
+            jam,
+            run: () => prosesUSMarket(state, game)
+        };
+    })
+];
+
+const pollerSelesaiHariIni = new Set();
+const pollerSedangJalan = new Set();
+let pollerTanggalTerakhir = '';
+
+function getDetikWIBHariIni() {
+    const parts = new Intl.DateTimeFormat('en-GB', {
+        timeZone: 'Asia/Jakarta',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hourCycle: 'h23'
+    }).formatToParts(new Date());
+
+    const h = Number(parts.find(p => p.type === 'hour').value);
+    const m = Number(parts.find(p => p.type === 'minute').value);
+    const s = Number(parts.find(p => p.type === 'second').value);
+    return h * 3600 + m * 60 + s;
+}
+
+function jalankanPollerBackground() {
+    const tglSekarang = iso(partsInTZ(new Date(), 'Asia/Jakarta'));
+    if (tglSekarang !== pollerTanggalTerakhir) {
+        pollerTanggalTerakhir = tglSekarang;
+        pollerSelesaiHariIni.clear();
+    }
+
+    const detikSekarang = getDetikWIBHariIni();
+
+    for (const item of JADWAL_POLLER_WIB) {
+        if (pollerSelesaiHariIni.has(item.id) || pollerSedangJalan.has(item.id)) continue;
+
+        const [hh, mm] = item.jam.split(':').map(Number);
+        const targetDetik = hh * 3600 + mm * 60;
+        const mulaiDetik = targetDetik - 30;
+        const batasDetik = targetDetik + 360;
+
+        const dalamJendela = mulaiDetik < 0
+            ? (detikSekarang >= 86400 + mulaiDetik || detikSekarang <= batasDetik)
+            : (detikSekarang >= mulaiDetik && detikSekarang <= batasDetik);
+
+        if (dalamJendela) {
+            pollerSedangJalan.add(item.id);
+            item.run()
+                .then(res => {
+                    const data = res?.data || res;
+                    if (data && data.status === 'sukses') {
+                        pollerSelesaiHariIni.add(item.id);
+                    }
+                })
+                .catch(() => {})
+                .finally(() => {
+                    pollerSedangJalan.delete(item.id);
+                });
+        }
+    }
 }
 
 // ================= SETUP SERVER / EXPORT =================
 
 const PORT = process.env.PORT || 8000;
 
-app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Server berjalan di port ${PORT}`);
-});
+if (require.main === module) {
+    app.listen(PORT, '0.0.0.0', () => {
+        console.log(`Server berjalan di port ${PORT}`);
+        setInterval(jalankanPollerBackground, 3000);
+    });
+}
 
 module.exports = app;
