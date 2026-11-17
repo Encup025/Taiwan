@@ -3,6 +3,7 @@ const axios = require('axios');
 const cheerio = require('cheerio');
 const cors = require('cors');
 const { randomUUID } = require('crypto');
+const { fetchDenganFallback } = require('./proxyHelper');
 const app = express();
 app.use(cors());
 
@@ -369,27 +370,20 @@ const diblokCF = data => {
 async function ambil(url) {
     const headers = getRandomHeaders();
 
-    const res = await axios.get(url, {
+    const data = await fetchDenganFallback(url, {
         headers,
-        timeout: 8000,
-        responseType: 'text',
-        maxRedirects: 5,
-        validateStatus: status => status >= 200 && status < 400
+        izinkanApiKey: true
     });
 
-    if (res.status !== 200) {
-        throw new Error(`HTTP ${res.status}`);
-    }
-
-    if (diblokCF(res.data)) {
+    if (diblokCF(data)) {
         throw new Error('Halaman ditolak atau menampilkan challenge Cloudflare.');
     }
 
-    if (typeof res.data !== 'string' || res.data.length < 100) {
+    if (typeof data !== 'string' || data.length < 100) {
         throw new Error('Respons HTML kosong atau terlalu pendek.');
     }
 
-    return res.data;
+    return data;
 }
 
 const inFlightFetch = new Map();
@@ -2411,7 +2405,7 @@ function ekstrakTambahan($, selector, src) {
     return $(selector).first().text().trim();
 }
 
-async function ambilSumberTambahan(src, signal) {
+async function ambilSumberTambahan(src, signal, izinkanApiKey = true) {
     const isApiJson = Boolean(src.hijau);
 
     // Hindari penambahan query ?_=Date.now() pada halaman HTML agar tidak ditolak WAF (403).
@@ -2457,43 +2451,13 @@ async function ambilSumberTambahan(src, signal) {
             'Sec-Fetch-User': '?1'
         };
 
-    let data = '';
-
-    try {
-        const res = await axios.get(url, {
-            headers,
-            timeout: 10000,
-            responseType: 'text',
-            httpsAgent: httpsAgentLonggar,
-            signal,
-            validateStatus: s => s >= 200 && s < 300
-        });
-
-        data = res.data;
-    } catch (axiosErr) {
-        // Fallback ke native fetch (Undici) jika mendapat 403 dari fingerprint TLS/HTTP axios
-        if (
-            axiosErr?.response?.status === 403 &&
-            typeof fetch === 'function'
-        ) {
-            const fetchRes = await fetch(url, {
-                headers: {
-                    ...headers,
-                    'Referer': 'https://www.google.com/',
-                    'Sec-Fetch-Site': 'cross-site'
-                },
-                signal
-            });
-
-            if (!fetchRes.ok) {
-                throw axiosErr;
-            }
-
-            data = await fetchRes.text();
-        } else {
-            throw axiosErr;
-        }
-    }
+    const data = await fetchDenganFallback(url, {
+        headers,
+        httpsAgent: httpsAgentLonggar,
+        signal,
+        isJson: isApiJson,
+        izinkanApiKey
+    });
 
     if (typeof data !== 'string' || data.length < 2) {
         throw new Error('respons kosong');
@@ -2601,16 +2565,39 @@ for (const [slug, cfg] of Object.entries(PASARAN_TAMBAHAN)) {
         const galat = [];
 
         try {
-            const menang = await Promise.any(
-                cfg.sumber.map(src =>
-                    ambilSumberTambahan(src, ctrl.signal).catch(err => {
-                        galat.push(`${hostDari(src.url)}: ${err.message}`);
-                        throw err;
-                    })
-                )
-            );
+            let menang;
 
-            ctrl.abort();
+            try {
+                menang = await Promise.any(
+                    cfg.sumber.map(src =>
+                        ambilSumberTambahan(src, ctrl.signal, false).catch(err => {
+                            galat.push(`${hostDari(src.url)}: ${err.message}`);
+                            throw err;
+                        })
+                    )
+                );
+
+                ctrl.abort();
+            } catch (firstErr) {
+                ctrl.abort();
+
+                const adaBlokir = galat.some(g =>
+                    /403|407|429|503|cloudflare|ditolak/i.test(g)
+                );
+
+                if (!adaBlokir) {
+                    throw firstErr;
+                }
+
+                menang = await ambilSumberTambahan(
+                    cfg.sumber[0],
+                    undefined,
+                    true
+                ).catch(err => {
+                    galat.push(`${hostDari(cfg.sumber[0].url)} (proxy): ${err.message}`);
+                    throw err;
+                });
+            }
 
             const payload = {
                 status: 'sukses',
@@ -2646,6 +2633,7 @@ function bentukResponsTambahan(full, debug) {
 }
 
 // ================= SETUP SERVER / EXPORT =================
+
 const PORT = process.env.PORT || 8000;
 
 app.listen(PORT, '0.0.0.0', () => {
@@ -2653,4 +2641,3 @@ app.listen(PORT, '0.0.0.0', () => {
 });
 
 module.exports = app;
-
