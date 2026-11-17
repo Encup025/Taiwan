@@ -3,9 +3,18 @@ const { HttpsProxyAgent } = require('https-proxy-agent');
 
 const KODE_BLOKIR = new Set([403, 407, 429, 503]);
 const keyHabisUntil = new Map();
+const jalurTercepatHost = new Map();
 
 let daftarProxyPublik = [];
 let waktuAmbilProxyPublik = 0;
+
+function getHost(targetUrl) {
+    try {
+        return new URL(targetUrl).hostname;
+    } catch {
+        return targetUrl;
+    }
+}
 
 function diblokCloudflare(data) {
     if (typeof data !== 'string') return true;
@@ -57,7 +66,7 @@ async function cobaCloudflareWorker(targetUrl, headers, signal) {
             ...headers,
             'x-relay-secret': process.env.CF_WORKER_SECRET || 'rahasia123'
         },
-        timeout: 9000,
+        timeout: 7500,
         responseType: 'text',
         signal,
         validateStatus: s => s >= 200 && s < 300
@@ -131,35 +140,29 @@ async function cobaWebshare(targetUrl, headers, signal) {
 
     if (!rawList.length) throw new Error('WEBSHARE_PROXY_URL belum diatur');
 
-    // Acak urutan dan coba maksimal 2 IP Webshare berbeda
+    // Balapkan 2 IP Webshare secara paralel agar tidak menunggu antrean timeout
     const kandidat = [...rawList].sort(() => Math.random() - 0.5).slice(0, 2);
-    let lastErr = null;
 
-    for (const proxyUrl of kandidat) {
-        if (signal?.aborted) break;
-        try {
+    return await Promise.any(
+        kandidat.map(async proxyUrl => {
             const agent = new HttpsProxyAgent(proxyUrl);
             const res = await axios.get(targetUrl, {
                 headers,
                 httpsAgent: agent,
                 httpAgent: agent,
                 proxy: false,
-                timeout: 9000,
+                timeout: 7000,
                 responseType: 'text',
                 signal,
                 validateStatus: s => s >= 200 && s < 300
             });
 
-            if (typeof res.data === 'string' && res.data.length >= 50 && !diblokCloudflare(res.data)) {
-                return res.data;
+            if (typeof res.data !== 'string' || res.data.length < 50 || diblokCloudflare(res.data)) {
+                throw new Error('Webshare terkena challenge Cloudflare');
             }
-            throw new Error('Webshare terkena challenge Cloudflare');
-        } catch (err) {
-            lastErr = err;
-        }
-    }
-
-    throw lastErr || new Error('Semua kandidat Webshare gagal');
+            return res.data;
+        })
+    );
 }
 
 // --- LAPIS 3B: ROTASI WEB UNBLOCKER API (SCRAPINGANT -> SCRAPERAPI -> ZENROWS) ---
@@ -224,57 +227,69 @@ async function fetchDenganFallback(targetUrl, options = {}) {
         izinkanApiKey = true
     } = options;
 
+    const host = getHost(targetUrl);
+    const cacheJalur = jalurTercepatHost.get(host);
+    const jalurAktif = cacheJalur && cacheJalur.exp > Date.now() ? cacheJalur.jalur : null;
+
     let lastErr = null;
 
-    // LAPIS 1: Direct Request (Axios -> Native Fetch)
-    try {
+    // LAPIS 1: Direct Request (Dilewati jika domain ini baru saja terbukti memblokir IP Koyeb)
+    if (!jalurAktif) {
         try {
-            const res = await axios.get(targetUrl, {
-                headers,
-                httpsAgent,
-                timeout: 9000,
-                responseType: 'text',
-                signal,
-                validateStatus: s => s >= 200 && s < 300
-            });
-            if (!isJson && diblokCloudflare(res.data)) throw new Error('diblokir Cloudflare');
-            if (typeof res.data === 'string' && res.data.length >= 2) return res.data;
-        } catch (axiosErr) {
-            if (isErrorBlokir(axiosErr) && typeof fetch === 'function') {
-                const fetchRes = await fetch(targetUrl, {
-                    headers: { ...headers, 'Referer': 'https://www.google.com/' },
-                    signal
+            try {
+                const res = await axios.get(targetUrl, {
+                    headers,
+                    httpsAgent,
+                    timeout: 6500,
+                    responseType: 'text',
+                    signal,
+                    validateStatus: s => s >= 200 && s < 300
                 });
-                if (!fetchRes.ok) {
-                    const e = new Error(`HTTP ${fetchRes.status}`);
-                    e.response = { status: fetchRes.status };
-                    throw e;
+                if (!isJson && diblokCloudflare(res.data)) throw new Error('diblokir Cloudflare');
+                if (typeof res.data === 'string' && res.data.length >= 2) return res.data;
+            } catch (axiosErr) {
+                if (isErrorBlokir(axiosErr) && typeof fetch === 'function') {
+                    const fetchRes = await fetch(targetUrl, {
+                        headers: { ...headers, 'Referer': 'https://www.google.com/' },
+                        signal
+                    });
+                    if (!fetchRes.ok) {
+                        const e = new Error(`HTTP ${fetchRes.status}`);
+                        e.response = { status: fetchRes.status };
+                        throw e;
+                    }
+                    const txt = await fetchRes.text();
+                    if (!isJson && diblokCloudflare(txt)) throw new Error('diblokir Cloudflare');
+                    return txt;
                 }
-                const txt = await fetchRes.text();
-                if (!isJson && diblokCloudflare(txt)) throw new Error('diblokir Cloudflare');
-                return txt;
+                throw axiosErr;
             }
-            throw axiosErr;
+        } catch (err) {
+            lastErr = err;
+            if (!isErrorBlokir(err) || signal?.aborted) throw err;
         }
-    } catch (err) {
-        lastErr = err;
-        if (!isErrorBlokir(err) || signal?.aborted) throw err;
     }
 
     // LAPIS 2: Proxy Gratis Tanpa API Key (CF Worker -> ProxyScrape)
-    if (process.env.CF_WORKER_URL && !signal?.aborted) {
-        try {
-            return await cobaCloudflareWorker(targetUrl, headers, signal);
-        } catch (e) {
-            lastErr = e;
+    if (!(jalurAktif === 'apikey' && izinkanApiKey)) {
+        if (process.env.CF_WORKER_URL && !signal?.aborted) {
+            try {
+                const data = await cobaCloudflareWorker(targetUrl, headers, signal);
+                jalurTercepatHost.set(host, { jalur: 'proxy', exp: Date.now() + 30 * 60 * 1000 });
+                return data;
+            } catch (e) {
+                lastErr = e;
+            }
         }
-    }
 
-    if (!signal?.aborted) {
-        try {
-            return await cobaProxyPublik(targetUrl, headers, signal);
-        } catch (e) {
-            lastErr = e;
+        if (!signal?.aborted) {
+            try {
+                const data = await cobaProxyPublik(targetUrl, headers, signal);
+                jalurTercepatHost.set(host, { jalur: 'proxy', exp: Date.now() + 30 * 60 * 1000 });
+                return data;
+            } catch (e) {
+                lastErr = e;
+            }
         }
     }
 
@@ -282,19 +297,24 @@ async function fetchDenganFallback(targetUrl, options = {}) {
     if (izinkanApiKey && !signal?.aborted) {
         if (process.env.WEBSHARE_PROXY_URL) {
             try {
-                return await cobaWebshare(targetUrl, headers, signal);
+                const data = await cobaWebshare(targetUrl, headers, signal);
+                jalurTercepatHost.set(host, { jalur: 'apikey', exp: Date.now() + 30 * 60 * 1000 });
+                return data;
             } catch (e) {
                 lastErr = e;
             }
         }
 
         try {
-            return await cobaWebUnblockerApi(targetUrl, signal);
+            const data = await cobaWebUnblockerApi(targetUrl, signal);
+            jalurTercepatHost.set(host, { jalur: 'apikey', exp: Date.now() + 30 * 60 * 1000 });
+            return data;
         } catch (e) {
             lastErr = e;
         }
     }
 
+    jalurTercepatHost.delete(host);
     throw lastErr || new Error('Gagal mengambil data dari semua jalur.');
 }
 
