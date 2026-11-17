@@ -35,6 +35,7 @@ function isErrorBlokir(err) {
     return (
         msg.includes('cloudflare') ||
         msg.includes('ditolak') ||
+        msg.includes('terblokir') ||
         msg.includes('403') ||
         msg.includes('429') ||
         msg.includes('503')
@@ -73,7 +74,7 @@ async function cobaCloudflareWorker(targetUrl, headers, signal) {
     });
 
     if (typeof res.data !== 'string' || res.data.length < 50 || diblokCloudflare(res.data)) {
-        throw new Error('CF Worker terblokir atau respons kosong');
+        throw new Error('CF Worker ditolak (403/Cloudflare)');
     }
     return res.data;
 }
@@ -99,10 +100,6 @@ async function ambilDaftarProxyScrape() {
 }
 
 async function cobaProxyPublik(targetUrl, headers, signal) {
-    if (process.env.ENABLE_PUBLIC_PROXY === '0') {
-        throw new Error('Proxy publik dinonaktifkan');
-    }
-
     const list = await ambilDaftarProxyScrape();
     if (!list.length) throw new Error('Daftar proxy publik kosong');
 
@@ -124,7 +121,7 @@ async function cobaProxyPublik(targetUrl, headers, signal) {
             });
 
             if (typeof res.data !== 'string' || res.data.length < 50 || diblokCloudflare(res.data)) {
-                throw new Error('Proxy publik gagal/diblokir');
+                throw new Error('Proxy publik ditolak (403/Cloudflare)');
             }
             return res.data;
         })
@@ -158,7 +155,7 @@ async function cobaWebshare(targetUrl, headers, signal) {
             });
 
             if (typeof res.data !== 'string' || res.data.length < 50 || diblokCloudflare(res.data)) {
-                throw new Error('Webshare terkena challenge Cloudflare');
+                throw new Error('Webshare ditolak (403/Cloudflare)');
             }
             return res.data;
         })
@@ -278,17 +275,17 @@ async function fetchDenganFallback(targetUrl, options = {}) {
                 jalurTercepatHost.set(host, { jalur: 'proxy', exp: Date.now() + 30 * 60 * 1000 });
                 return data;
             } catch (e) {
-                lastErr = e;
+                if (!lastErr || isErrorBlokir(e)) lastErr = e;
             }
         }
 
-        if (!signal?.aborted) {
+        if (process.env.ENABLE_PUBLIC_PROXY !== '0' && !signal?.aborted) {
             try {
                 const data = await cobaProxyPublik(targetUrl, headers, signal);
                 jalurTercepatHost.set(host, { jalur: 'proxy', exp: Date.now() + 30 * 60 * 1000 });
                 return data;
             } catch (e) {
-                lastErr = e;
+                if (!lastErr || isErrorBlokir(e)) lastErr = e;
             }
         }
     }
@@ -301,7 +298,7 @@ async function fetchDenganFallback(targetUrl, options = {}) {
                 jalurTercepatHost.set(host, { jalur: 'apikey', exp: Date.now() + 30 * 60 * 1000 });
                 return data;
             } catch (e) {
-                lastErr = e;
+                if (!lastErr || isErrorBlokir(e)) lastErr = e;
             }
         }
 
@@ -310,12 +307,12 @@ async function fetchDenganFallback(targetUrl, options = {}) {
             jalurTercepatHost.set(host, { jalur: 'apikey', exp: Date.now() + 30 * 60 * 1000 });
             return data;
         } catch (e) {
-            lastErr = e;
+            if (!lastErr || isErrorBlokir(e)) lastErr = e;
         }
     }
 
     jalurTercepatHost.delete(host);
-    throw lastErr || new Error('Gagal mengambil data dari semua jalur.');
+    throw lastErr || new Error('Jalur tanpa API key ditolak (403/Cloudflare)');
 }
 
 module.exports = { fetchDenganFallback, isErrorBlokir };
